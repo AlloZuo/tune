@@ -10,12 +10,16 @@ const PLAYLISTS_FILE: &str = "tune_playlists.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server_url: String,
+    /// Server type identifier (e.g. "file-transfer", "navidrome").
+    /// Determines which MusicServer adapter to use.
+    pub server_type: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             server_url: String::new(),
+            server_type: "file-transfer".to_string(),
         }
     }
 }

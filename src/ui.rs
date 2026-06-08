@@ -9,7 +9,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::api::MusicEntry;
+use crate::api::{MusicEntry, MusicServer};
+use std::sync::Arc;
 use crate::player::{Player, PlayerState};
 
 // ──────────────────────────────────────────────
@@ -107,6 +108,10 @@ pub struct App {
     pub pick_index: usize,
     /// Current server base URL.
     pub server_url: String,
+    /// Server type identifier (e.g. "file-transfer").
+    pub server_type: String,
+    /// Music server adapter instance.
+    pub server: Arc<dyn MusicServer>,
     /// True when editing the server URL.
     pub config_mode: bool,
     /// Input buffer for the new server URL.
@@ -118,7 +123,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(player: Player) -> Self {
+    pub fn new(player: Player, server: Arc<dyn MusicServer>, server_type: String, server_url: String) -> Self {
         let mut list_state = ratatui::widgets::ListState::default();
         list_state.select(Some(0));
         Self {
@@ -141,7 +146,9 @@ impl App {
             new_playlist_name: String::new(),
             picking_playlist: false,
             pick_index: 0,
-            server_url: String::new(),
+            server,
+            server_type,
+            server_url,
             config_mode: false,
             config_input: String::new(),
             show_help: false,
@@ -660,11 +667,17 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         .trim_start_matches("https://")
         .to_string();
 
+    let server_tag = if url_display.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] {}", app.server_type, url_display)
+    };
+
     let title = format!(
         " ♪ 音源播放器 [{}]{}  {}  |  {} 首  {} 歌单",
         view_label,
         source_tag,
-        url_display,
+        server_tag,
         app.all_music.len(),
         app.playlists.len(),
     );
@@ -1106,15 +1119,27 @@ fn render_config_overlay(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let block = Block::default()
-        .title(" 配置服务器地址 ")
+        .title(" 配置服务器 ")
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
         .border_style(Style::new().fg(Color::Cyan))
         .style(Style::new().bg(Color::Black));
 
-    let input = Paragraph::new(Text::from(display.as_str()))
-        .style(Style::new().fg(Color::White))
-        .block(block);
+    // Show server type + URL
+    let type_line = Line::from(vec![
+        Span::styled("  类型: ", Style::new().fg(Color::DarkGray)),
+        Span::styled(app.server_type.clone(), Style::new().fg(Color::Yellow)),
+    ]);
+
+    let url_prompt = Span::styled("  URL: ", Style::new().fg(Color::DarkGray));
+
+    let input = Paragraph::new(Text::from(vec![
+        type_line,
+        Line::from(""),
+        Line::from(vec![url_prompt, Span::styled(display, Style::new().fg(Color::White))]),
+    ]))
+    .style(Style::new().bg(Color::Black))
+    .block(block);
 
     frame.render_widget(input, overlay_area);
 }

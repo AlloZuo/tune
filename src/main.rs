@@ -17,7 +17,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use api::{fetch_music_list, get_music_url, MusicEntry};
+use api::{create_server, MusicEntry, MusicServer};
 use player::{PlayMode, Player, PlayerState, ShuffleState, TrackInfo};
 use store::{load_config, load_playlists, save_config, save_playlists};
 use ui::{draw, App, AppEvent, PlayingSource, ViewMode};
@@ -44,11 +44,11 @@ async fn main() -> Result<()> {
     let (msg_tx, mut msg_rx) = mpsc::channel::<MainMessage>(32);
 
     let player = Player::new()?;
-    let mut app = App::new(player);
 
     // ── Load config & playlists ──
     let config = load_config();
-    app.server_url = config.server_url.clone();
+    let server = create_server(&config.server_type, &config.server_url);
+    let mut app = App::new(player, server, config.server_type.clone(), config.server_url.clone());
     let saved_playlists = load_playlists();
     if !saved_playlists.is_empty() {
         app.playlists = saved_playlists;
@@ -511,9 +511,12 @@ fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Sender<MainMess
             app.config_mode = false;
             app.config_input.clear();
             if !new_url.is_empty() {
-                app.server_url = new_url;
+                app.server_url.clone_from(&new_url);
+                // Rebuild the server adapter with the new URL
+                app.server = create_server(&app.server_type, &new_url);
                 let config = store::Config {
-                    server_url: app.server_url.clone(),
+                    server_url: new_url,
+                    server_type: app.server_type.clone(),
                 };
                 let _ = save_config(&config);
                 app.status_message = format!("服务器地址已更新: {}", app.server_url);
@@ -581,7 +584,7 @@ fn start_playback_inner(app: &mut App, tx: mpsc::Sender<MainMessage>, music: Mus
     app.status_message = format!("⏳ 正在缓冲: {}...", music.name);
     app.error_message = None;
 
-    let url = get_music_url(&app.server_url, &music.absolute_path);
+    let url = app.server.stream_url(&music.absolute_path);
     let tx = tx.clone();
 
     tokio::spawn(async move {
@@ -606,10 +609,10 @@ fn refresh_music_list(app: &App, tx: &mpsc::Sender<MainMessage>) {
     if app.server_url.is_empty() {
         return;
     }
-    let url = app.server_url.clone();
+    let server = app.server.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
-        match fetch_music_list(&url).await {
+        match server.fetch_list().await {
             Ok(list) => {
                 let _ = tx.send(MainMessage::MusicListLoaded(list)).await;
             }

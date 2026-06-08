@@ -1,5 +1,9 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+// ── Shared data types ──
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MusicEntry {
@@ -20,17 +24,65 @@ pub struct MusicListResponse {
     pub children: Vec<MusicEntry>,
 }
 
-/// Fetch music list from the server API.
-pub async fn fetch_music_list(base_url: &str) -> Result<Vec<MusicEntry>> {
-    let url = format!("{}/musicsV2", base_url);
-    let resp: MusicListResponse = reqwest::get(&url).await?.json().await?;
-    Ok(resp.children)
+// ── MusicServer trait ──
+
+/// Abstract interface for a music server backend.
+///
+/// Each server type implements this trait to provide:
+/// - A list of available music entries
+/// - A streamable URL for any given file path
+#[async_trait]
+pub trait MusicServer: Send + Sync {
+    /// Human-readable server type name (e.g. "文件闪传", "Navidrome").
+    fn name(&self) -> &str;
+
+    /// Base URL of the server.
+    fn base_url(&self) -> &str;
+
+    /// Fetch the complete list of music entries from the server.
+    async fn fetch_list(&self) -> Result<Vec<MusicEntry>>;
+
+    /// Build a playable / streamable URL for the given absolute file path.
+    fn stream_url(&self, absolute_path: &str) -> String;
 }
 
-/// Build the playable URL for a music file.
-pub fn get_music_url(base_url: &str, absolute_path: &str) -> String {
-    let encoded_path = encode_url_path(absolute_path);
-    format!("{}/file?path={}", base_url, encoded_path)
+// ── 文件闪传 (Fast File Transfer) adapter ──
+
+/// Adapter for the 文件闪传 mobile app server.
+///
+/// Endpoints:
+/// - `GET {base}/musicsV2` → `{ children: [...] }`
+/// - `GET {base}/file?path={encoded_path}` → audio stream
+pub struct FileTransferServer {
+    base_url: String,
+}
+
+impl FileTransferServer {
+    pub fn new(base_url: String) -> Self {
+        Self { base_url }
+    }
+}
+
+#[async_trait]
+impl MusicServer for FileTransferServer {
+    fn name(&self) -> &str {
+        "文件闪传"
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    async fn fetch_list(&self) -> Result<Vec<MusicEntry>> {
+        let url = format!("{}/musicsV2", self.base_url);
+        let resp: MusicListResponse = reqwest::get(&url).await?.json().await?;
+        Ok(resp.children)
+    }
+
+    fn stream_url(&self, absolute_path: &str) -> String {
+        let encoded_path = encode_url_path(absolute_path);
+        format!("{}/file?path={}", self.base_url, encoded_path)
+    }
 }
 
 fn encode_url_path(path: &str) -> String {
@@ -52,4 +104,19 @@ fn encode_url_path(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+// ── Factory ──
+
+/// Create a music server adapter from a type identifier and base URL.
+///
+/// Supported server types:
+/// - `"file-transfer"` — 文件闪传 (default)
+///
+/// Unknown types fall back to `file-transfer`.
+pub fn create_server(server_type: &str, base_url: &str) -> Arc<dyn MusicServer> {
+    match server_type {
+        "file-transfer" => Arc::new(FileTransferServer::new(base_url.to_string())),
+        _ => Arc::new(FileTransferServer::new(base_url.to_string())),
+    }
 }
