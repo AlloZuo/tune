@@ -1,5 +1,8 @@
 mod api;
+mod local;
+mod log;
 mod lyrics;
+mod navidrome;
 mod player;
 mod store;
 mod ui;
@@ -17,9 +20,10 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use api::{create_server, MusicEntry, MusicServer};
+use api::{create_server_pool, MusicEntry};
+use lyrics::Lyrics;
 use player::{PlayMode, Player, PlayerState, ShuffleState, TrackInfo};
-use store::{load_config, load_playlists, save_config, save_playlists};
+use store::{load_configs, load_playlists, save_configs, save_playlists};
 use ui::{draw, App, AppEvent, PlayingSource, ViewMode};
 
 // ── Background messages ──
@@ -27,7 +31,7 @@ use ui::{draw, App, AppEvent, PlayingSource, ViewMode};
 enum MainMessage {
     MusicListLoaded(Vec<MusicEntry>),
     MusicListLoadFailed(String),
-    AudioDownloaded(MusicEntry, Vec<u8>),
+    AudioDownloaded(MusicEntry, Vec<u8>, Option<Lyrics>),
     AudioDownloadFailed(String),
 }
 
@@ -41,23 +45,26 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    // Initialise file logger (appends to tune.log in the working directory).
+    log::init("tune.log");
+
     let (msg_tx, mut msg_rx) = mpsc::channel::<MainMessage>(32);
 
     let player = Player::new()?;
 
-    // ── Load config & playlists ──
-    let config = load_config();
-    let server = create_server(&config.server_type, &config.server_url);
-    let mut app = App::new(player, server, config.server_type.clone(), config.server_url.clone());
+    // ── Load configs & playlists ──
+    let configs = load_configs();
+    let server = create_server_pool(&configs);
+    let mut app = App::new(player, server, configs);
     let saved_playlists = load_playlists();
     if !saved_playlists.is_empty() {
         app.playlists = saved_playlists;
     }
 
     // ── If no server configured, prompt on first screen ──
-    if app.server_url.is_empty() {
+    if app.server_configs.is_empty() || app.server_configs.iter().all(|c| c.server_url.is_empty()) {
         app.config_mode = true;
-        app.status_message = "请先配置服务器地址 (输入后按 Enter 确认)".to_string();
+        app.status_message = "请先添加服务器 (按 Enter 编辑, Tab 切换字段)".to_string();
     } else {
         refresh_music_list(&app, &msg_tx);
     }
@@ -77,11 +84,15 @@ async fn main() -> Result<()> {
                     app.error_message = Some(err);
                     app.status_message = "加载失败".to_string();
                 }
-                MainMessage::AudioDownloaded(music, data) => {
+                MainMessage::AudioDownloaded(music, data, server_lyrics) => {
                     app.downloading = false;
 
-                    // Extract embedded lyrics from the audio file
-                    let lyrics = lyrics::extract_lyrics(&data);
+                    // Priority: 1) server lyrics that are timed (LRC), 2) embedded
+                    // lyrics from audio tags, 3) server plain text as last resort.
+                    let lyrics = match server_lyrics {
+                        Some(Lyrics::Timed(_)) => server_lyrics,  // server LRC → trust it
+                        _ => lyrics::extract_lyrics(&data).or(server_lyrics), // or embedded, or server plain
+                    };
 
                     let track = TrackInfo {
                         title: music.name.clone(),
@@ -491,7 +502,7 @@ fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Sender<MainMess
 
         // ── Refresh ──
         AppEvent::Refresh => {
-            if app.server_url.is_empty() {
+            if app.server_configs.is_empty() || app.server_configs.iter().all(|c| c.server_url.is_empty()) {
                 app.status_message = "请先按 R 配置服务器地址".to_string();
                 false
             } else {
@@ -502,30 +513,33 @@ fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Sender<MainMess
         }
         AppEvent::ConfigureServer => {
             app.config_mode = true;
-            app.config_input.clear();
-            app.config_input = app.server_url.clone();
+            app.config_phase = 0; // list
+            app.config_focus = 0;
+            app.config_edit_idx = 0;
+            app.config_inputs.clear();
+            // Work on a snapshot of configs
+            app.config_servers = app.server_configs.clone();
             false
         }
         AppEvent::ConfirmConfig => {
-            let new_url = app.config_input.trim().to_string();
+            // Save all configs and rebuild server pool
             app.config_mode = false;
-            app.config_input.clear();
-            if !new_url.is_empty() {
-                app.server_url.clone_from(&new_url);
-                // Rebuild the server adapter with the new URL
-                app.server = create_server(&app.server_type, &new_url);
-                let config = store::Config {
-                    server_url: new_url,
-                    server_type: app.server_type.clone(),
-                };
-                let _ = save_config(&config);
-                app.status_message = format!("服务器地址已更新: {}", app.server_url);
-                // Re-fetch with new URL
+            app.config_phase = 0;
+            app.config_inputs.clear();
+            app.server_configs = std::mem::take(&mut app.config_servers);
+            app.server = create_server_pool(&app.server_configs);
+            let _ = save_configs(&app.server_configs);
+            let count = app.server_configs.len();
+            app.status_message = format!(
+                "已保存 {} 个服务器配置",
+                count
+            );
+            // Re-fetch with new config
+            if app.server_configs.iter().any(|c| !c.server_url.is_empty()) {
                 refresh_music_list(app, tx);
-                true
-            } else {
-                false
+                return true;
             }
+            false
         }
         AppEvent::None => {
             app.status_message =
@@ -581,22 +595,24 @@ fn start_playback_inner(app: &mut App, tx: mpsc::Sender<MainMessage>, music: Mus
     }
 
     app.downloading = true;
-    app.status_message = format!("⏳ 正在缓冲: {}...", music.name);
+    app.status_message = format!("⏳ 正在加载: {}...", music.name);
     app.error_message = None;
 
-    let url = app.server.stream_url(&music.absolute_path);
+    let server = app.server.clone();
     let tx = tx.clone();
 
     tokio::spawn(async move {
-        match download_audio(&url).await {
+        match server.fetch_audio(&music).await {
             Ok(data) => {
+                // Try server-side lyrics (e.g. Subsonic getLyrics API)
+                let server_lyrics = server.fetch_lyrics(&music).await;
                 let _ = tx
-                    .send(MainMessage::AudioDownloaded(music, data))
+                    .send(MainMessage::AudioDownloaded(music, data, server_lyrics))
                     .await;
             }
             Err(e) => {
                 let _ = tx
-                    .send(MainMessage::AudioDownloadFailed(format!("下载失败: {}", e)))
+                    .send(MainMessage::AudioDownloadFailed(format!("加载失败: {}", e)))
                     .await;
             }
         }
@@ -604,11 +620,7 @@ fn start_playback_inner(app: &mut App, tx: mpsc::Sender<MainMessage>, music: Mus
 }
 
 /// Spawn a background task to re-fetch the music list.
-/// Does nothing if the server URL is empty.
 fn refresh_music_list(app: &App, tx: &mpsc::Sender<MainMessage>) {
-    if app.server_url.is_empty() {
-        return;
-    }
     let server = app.server.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -626,16 +638,6 @@ fn refresh_music_list(app: &App, tx: &mpsc::Sender<MainMessage>) {
             }
         }
     });
-}
-
-async fn download_audio(url: &str) -> Result<Vec<u8>> {
-    let response = reqwest::get(url).await?;
-    let status = response.status();
-    if !status.is_success() {
-        anyhow::bail!("HTTP {}", status);
-    }
-    let bytes = response.bytes().await?;
-    Ok(bytes.to_vec())
 }
 
 fn format_duration(ms: u64) -> String {

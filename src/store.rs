@@ -1,42 +1,60 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::api::MusicEntry;
+use crate::api::{MusicEntry, ServerConfig};
 use crate::ui::Playlist;
 
 const CONFIG_FILE: &str = "tune_config.json";
 const PLAYLISTS_FILE: &str = "tune_playlists.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
-    pub server_url: String,
-    /// Server type identifier (e.g. "file-transfer", "navidrome").
-    /// Determines which MusicServer adapter to use.
-    pub server_type: String,
-}
+// ── Config (multi-server) ──
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server_url: String::new(),
-            server_type: "file-transfer".to_string(),
-        }
+/// Load all persisted server configs from disk.
+/// Handles migration from old single-config format.
+pub fn load_configs() -> Vec<ServerConfig> {
+    let content = match std::fs::read_to_string(CONFIG_FILE) {
+        Ok(c) => c,
+        Err(_) => return vec![ServerConfig::default()],
+    };
+
+    // New format: JSON array
+    if let Ok(configs) = serde_json::from_str::<Vec<ServerConfig>>(&content) {
+        return configs;
     }
+
+    // Old format: single object → migrate
+    if let Ok(config) = serde_json::from_str::<ServerConfigOld>(&content) {
+        let migrated = vec![ServerConfig {
+            name: config.server_type.clone(),
+            server_url: config.server_url,
+            server_type: config.server_type,
+            username: config.username,
+            password: config.password,
+            disabled: false,
+        }];
+        // Save migrated format
+        let _ = save_configs(&migrated);
+        return migrated;
+    }
+
+    vec![ServerConfig::default()]
 }
 
-// ── Config ──
-
-pub fn load_config() -> Config {
-    std::fs::read_to_string(CONFIG_FILE)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_config(config: &Config) -> Result<()> {
-    let json = serde_json::to_string_pretty(config)?;
+pub fn save_configs(configs: &[ServerConfig]) -> Result<()> {
+    let json = serde_json::to_string_pretty(configs)?;
     std::fs::write(CONFIG_FILE, json)?;
     Ok(())
+}
+
+/// Old single-server config format (for migration).
+#[derive(Debug, Clone, Deserialize)]
+struct ServerConfigOld {
+    server_url: String,
+    server_type: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
 }
 
 // ── Playlists ──

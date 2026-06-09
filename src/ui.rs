@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::api::{MusicEntry, MusicServer};
+use crate::api::{MusicEntry, MusicServer, ServerConfig};
 use std::sync::Arc;
 use crate::player::{Player, PlayerState};
 
@@ -106,16 +106,22 @@ pub struct App {
     pub picking_playlist: bool,
     /// Index selected inside the picker.
     pub pick_index: usize,
-    /// Current server base URL.
-    pub server_url: String,
-    /// Server type identifier (e.g. "file-transfer").
-    pub server_type: String,
+    /// Server configurations (multiple servers).
+    pub server_configs: Vec<ServerConfig>,
+    /// Working copy of configs while editing.
+    pub config_servers: Vec<ServerConfig>,
     /// Music server adapter instance.
     pub server: Arc<dyn MusicServer>,
-    /// True when editing the server URL.
+    /// True when editing server configuration.
     pub config_mode: bool,
-    /// Input buffer for the new server URL.
-    pub config_input: String,
+    /// 0 = server list, 1 = editing a single server.
+    pub config_phase: u8,
+    /// In list mode: selected server index. In edit mode: focused field index.
+    pub config_focus: usize,
+    /// Which server config we're editing (index into config_servers).
+    pub config_edit_idx: usize,
+    /// Input buffers for each config field (in edit mode).
+    pub config_inputs: Vec<String>,
     /// True when showing the help overlay.
     pub show_help: bool,
     /// Which list the current track came from (for auto-next).
@@ -123,7 +129,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(player: Player, server: Arc<dyn MusicServer>, server_type: String, server_url: String) -> Self {
+    pub fn new(player: Player, server: Arc<dyn MusicServer>, configs: Vec<ServerConfig>) -> Self {
         let mut list_state = ratatui::widgets::ListState::default();
         list_state.select(Some(0));
         Self {
@@ -147,10 +153,13 @@ impl App {
             picking_playlist: false,
             pick_index: 0,
             server,
-            server_type,
-            server_url,
+            server_configs: configs,
+            config_servers: Vec::new(),
             config_mode: false,
-            config_input: String::new(),
+            config_phase: 0,
+            config_focus: 0,
+            config_edit_idx: 0,
+            config_inputs: Vec::new(),
             show_help: false,
             playing_source: None,
         }
@@ -217,8 +226,13 @@ impl App {
     /// Add a music entry to a playlist by index.
     pub fn add_to_playlist(&mut self, pl_idx: usize, music: MusicEntry) {
         if pl_idx < self.playlists.len() {
-            // Avoid duplicates
-            if !self.playlists[pl_idx].songs.iter().any(|s| s.id == music.id) {
+            // Avoid duplicates by absolute_path (unique per song across all backends).
+            // Note: `id` is unreliable (Navidrome always sets it to 0).
+            if !self.playlists[pl_idx]
+                .songs
+                .iter()
+                .any(|s| s.absolute_path == music.absolute_path)
+            {
                 self.playlists[pl_idx].songs.push(music);
             }
         }
@@ -423,22 +437,145 @@ impl App {
 
         // ── Config-server overlay ──
         if self.config_mode {
-            return match key.code {
-                KeyCode::Enter => Some(AppEvent::ConfirmConfig),
-                KeyCode::Esc => {
-                    self.config_mode = false;
-                    self.config_input.clear();
-                    Some(AppEvent::None)
+            return if self.config_phase == 0 {
+                // ── Server list phase ──
+                match key.code {
+                    KeyCode::Up => {
+                        if !self.config_servers.is_empty() && self.config_focus > 0 {
+                            self.config_focus -= 1;
+                        }
+                        None
+                    }
+                    KeyCode::Down => {
+                        if !self.config_servers.is_empty()
+                            && self.config_focus + 1 < self.config_servers.len()
+                        {
+                            self.config_focus += 1;
+                        }
+                        None
+                    }
+                    KeyCode::Enter => {
+                        // Enter edit mode for selected server, or add new if empty
+                        if self.config_servers.is_empty() {
+                            self.config_servers.push(ServerConfig::default());
+                        }
+                        self.config_edit_idx = self.config_focus.min(self.config_servers.len().saturating_sub(1));
+                        let cfg = &self.config_servers[self.config_edit_idx];
+                        self.config_inputs = vec![
+                            cfg.name.clone(),
+                            cfg.server_type.clone(),
+                            cfg.server_url.clone(),
+                            cfg.username.clone(),
+                            cfg.password.clone(),
+                        ];
+                        self.config_focus = 0;
+                        self.config_phase = 1;
+                        None
+                    }
+                    KeyCode::Char('a') => {
+                        let idx = self.config_servers.len();
+                        self.config_servers.push(ServerConfig::default());
+                        self.config_focus = idx;
+                        self.config_edit_idx = idx;
+                        let cfg = &self.config_servers[idx];
+                        self.config_inputs = vec![
+                            cfg.name.clone(),
+                            cfg.server_type.clone(),
+                            cfg.server_url.clone(),
+                            cfg.username.clone(),
+                            cfg.password.clone(),
+                        ];
+                        self.config_focus = 0;
+                        self.config_phase = 1;
+                        None
+                    }
+                    KeyCode::Char('d') => {
+                        if self.config_focus < self.config_servers.len() {
+                            self.config_servers.remove(self.config_focus);
+                            if self.config_focus >= self.config_servers.len() && !self.config_servers.is_empty() {
+                                self.config_focus = self.config_servers.len() - 1;
+                            }
+                        }
+                        None
+                    }
+                    KeyCode::Char(' ') => {
+                        // Toggle disabled state for the selected server
+                        if self.config_focus < self.config_servers.len() {
+                            let cfg = &mut self.config_servers[self.config_focus];
+                            cfg.disabled = !cfg.disabled;
+                        }
+                        None
+                    }
+                    KeyCode::Esc => Some(AppEvent::ConfirmConfig),
+                    _ => None,
                 }
-                KeyCode::Backspace => {
-                    self.config_input.pop();
-                    None
+            } else {
+                // ── Edit single server phase ──
+                match key.code {
+                    KeyCode::Enter => {
+                        // Save this server and go back to list
+                        if self.config_inputs.len() >= 5 && self.config_edit_idx < self.config_servers.len() {
+                            self.config_servers[self.config_edit_idx].name = self.config_inputs[0].clone();
+                            self.config_servers[self.config_edit_idx].server_type = self.config_inputs[1].clone();
+                            let url = self.config_inputs[2].trim().to_string();
+                            self.config_servers[self.config_edit_idx].server_url = url;
+                            self.config_servers[self.config_edit_idx].username = self.config_inputs[3].trim().to_string();
+                            self.config_servers[self.config_edit_idx].password = self.config_inputs[4].clone();
+                        }
+                        self.config_inputs.clear();
+                        self.config_focus = self.config_edit_idx;
+                        self.config_phase = 0;
+                        None
+                    }
+                    KeyCode::Esc => {
+                        // Discard edits, back to list
+                        self.config_inputs.clear();
+                        self.config_focus = self.config_edit_idx;
+                        self.config_phase = 0;
+                        None
+                    }
+                    KeyCode::Tab | KeyCode::Down => {
+                        if !self.config_inputs.is_empty() {
+                            self.config_focus = (self.config_focus + 1) % self.config_inputs.len();
+                        }
+                        None
+                    }
+                    KeyCode::Up => {
+                        if !self.config_inputs.is_empty() {
+                            self.config_focus = (self.config_focus + self.config_inputs.len() - 1) % self.config_inputs.len();
+                        }
+                        None
+                    }
+                    // Left/Right cycle server type when focus is on the type field (index 1)
+                    KeyCode::Left | KeyCode::Right => {
+                        if self.config_focus == 1 && self.config_inputs.len() >= 5 {
+                            let types = ["file-transfer", "navidrome", "local"];
+                            let current = self.config_inputs[1].clone();
+                            let idx = types.iter().position(|t| *t == current).unwrap_or(0);
+                            let next = match key.code {
+                                KeyCode::Right => (idx + 1) % types.len(),
+                                _ => (idx + types.len() - 1) % types.len(),
+                            };
+                            self.config_inputs[1] = types[next].to_string();
+                        }
+                        None
+                    }
+                    KeyCode::Backspace => {
+                        // Block backspace on type (index 1) only; name (0) and others are editable
+                        if self.config_focus != 1 && self.config_focus < self.config_inputs.len() {
+                            self.config_inputs[self.config_focus].pop();
+                        }
+                        None
+                    }
+                    KeyCode::Char(c) => {
+                        // Block char input on type (index 1) only
+                        if self.config_focus != 1 && self.config_focus < self.config_inputs.len() {
+                            self.config_inputs[self.config_focus].push(c);
+                        }
+                        None
+                    }
+                    _ => None,
                 }
-                KeyCode::Char(c) => {
-                    self.config_input.push(c);
-                    None
-                }
-                _ => None,
             };
         }
 
@@ -660,17 +797,18 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         _ => String::new(),
     };
 
-    // Truncate server URL for display
-    let url_display = app
-        .server_url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .to_string();
-
-    let server_tag = if url_display.is_empty() {
+    // Show server count or first server info
+    let server_tag = if app.server_configs.is_empty() {
         String::new()
+    } else if app.server_configs.len() == 1 {
+        let cfg = &app.server_configs[0];
+        let url = cfg
+            .server_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://");
+        format!("[{}] {}", cfg.server_type, url)
     } else {
-        format!("[{}] {}", app.server_type, url_display)
+        format!("[{} 个服务器]", app.server_configs.len())
     };
 
     let title = format!(
@@ -971,7 +1109,7 @@ fn render_playback_bar(frame: &mut Frame, area: Rect, app: &App) {
             .player
             .current_track()
             .map_or(1, |t| t.total_duration_ms.max(1));
-        (app.player.position_ms() as f64 / total as f64 * 100.0) as u16
+        ((app.player.position_ms() as f64 / total as f64 * 100.0).round() as u16).clamp(0, 100)
     } else {
         0
     };
@@ -1109,39 +1247,137 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, _app: &App) {
 }
 
 fn render_config_overlay(frame: &mut Frame, area: Rect, app: &App) {
-    let overlay_area = centered_rect(70, 20, area);
+    if app.config_phase == 0 {
+        render_config_list(frame, area, app);
+    } else {
+        render_config_edit(frame, area, app);
+    }
+}
+
+/// Config phase 0: server list (select, add, delete).
+fn render_config_list(frame: &mut Frame, area: Rect, app: &App) {
+    let overlay_area = centered_rect(60, 30, area);
     frame.render_widget(Clear, overlay_area);
 
-    let display = if app.config_input.is_empty() {
-        app.server_url.clone()
-    } else {
-        app.config_input.clone()
-    };
-
     let block = Block::default()
-        .title(" 配置服务器 ")
+        .title(" 服务器管理 (Enter编辑 a添加 d删除 Space停用 Esc保存) ")
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
         .border_style(Style::new().fg(Color::Cyan))
         .style(Style::new().bg(Color::Black));
 
-    // Show server type + URL
-    let type_line = Line::from(vec![
-        Span::styled("  类型: ", Style::new().fg(Color::DarkGray)),
-        Span::styled(app.server_type.clone(), Style::new().fg(Color::Yellow)),
-    ]);
+    let mut lines: Vec<Line> = Vec::new();
+    if app.config_servers.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  暂无服务器，按 a 添加",
+            Style::new().fg(Color::DarkGray),
+        )));
+    } else {
+        for (i, cfg) in app.config_servers.iter().enumerate() {
+            let is_selected = i == app.config_focus;
+            let prefix = if is_selected { " ▸ " } else { "   " };
+            let url_short = cfg
+                .server_url
+                .trim_start_matches("http://")
+                .trim_start_matches("https://");
+            let label = if cfg.name.is_empty() {
+                format!("{} ({})", cfg.server_type, url_short)
+            } else {
+                format!("{} [{}] ({})", cfg.name, cfg.server_type, url_short)
+            };
+            let status = if cfg.disabled {
+                " [停用]"
+            } else {
+                ""
+            };
+            let style = if cfg.disabled {
+                // Dimmed style for disabled servers
+                if is_selected {
+                    Style::new().fg(Color::DarkGray).bg(Color::Blue)
+                } else {
+                    Style::new().fg(Color::DarkGray)
+                }
+            } else {
+                if is_selected {
+                    Style::new().fg(Color::White).bg(Color::Blue)
+                } else {
+                    Style::new().fg(Color::White)
+                }
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{}{}{}", prefix, label, status),
+                style,
+            )));
+        }
+    }
 
-    let url_prompt = Span::styled("  URL: ", Style::new().fg(Color::DarkGray));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .style(Style::new().bg(Color::Black))
+        .block(block);
+    frame.render_widget(paragraph, overlay_area);
+}
 
-    let input = Paragraph::new(Text::from(vec![
-        type_line,
-        Line::from(""),
-        Line::from(vec![url_prompt, Span::styled(display, Style::new().fg(Color::White))]),
-    ]))
-    .style(Style::new().bg(Color::Black))
-    .block(block);
+/// Config phase 1: edit a single server's fields.
+fn render_config_edit(frame: &mut Frame, area: Rect, app: &App) {
+    let overlay_area = centered_rect(70, 35, area);
+    frame.render_widget(Clear, overlay_area);
 
-    frame.render_widget(input, overlay_area);
+    let block = Block::default()
+        .title(" 编辑服务器 (Tab切换 Enter保存) ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::new().fg(Color::Cyan))
+        .style(Style::new().bg(Color::Black));
+
+    // Field labels and their input indices
+    let fields: &[(&str, usize)] = &[
+        ("名称", 0),   // editable text
+        ("类型", 1),   // ←/→ cycling
+        ("URL", 2),    // editable text
+        ("用户名", 3), // editable text
+        ("密码", 4),   // editable text, masked
+    ];
+
+    let mut lines = Vec::new();
+    for &(label, idx) in fields {
+        let is_focused = idx == app.config_focus;
+        let value = if idx == 1 {
+            // Type selector
+            let type_val = app.config_inputs.get(idx).map(|s| s.as_str()).unwrap_or("file-transfer");
+            if is_focused {
+                format!(" ◄ {} ► ", type_val)
+            } else {
+                format!(" {} ", type_val)
+            }
+        } else if idx == 4 && !is_focused {
+            // Password: show asterisks when not editing
+            let len = app.config_inputs.get(idx).map(|s| s.len()).unwrap_or(0);
+            "*".repeat(len.min(20))
+        } else {
+            app.config_inputs.get(idx).map(|s| s.as_str()).unwrap_or("").to_string()
+        };
+        let prefix = if is_focused { " ▸ " } else { "   " };
+        let value_style = if is_focused {
+            if idx == 1 {
+                Style::new().fg(Color::White).bg(Color::Blue)
+            } else {
+                Style::new().fg(Color::White).bg(Color::Blue)
+            }
+        } else if idx == 1 {
+            Style::new().fg(Color::Yellow)
+        } else {
+            Style::new().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}{}: ", prefix, label), Style::new().fg(Color::DarkGray)),
+            Span::styled(value, value_style),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .style(Style::new().bg(Color::Black))
+        .block(block);
+    frame.render_widget(paragraph, overlay_area);
 }
 
 fn render_pick_playlist_overlay(frame: &mut Frame, area: Rect, app: &App) {

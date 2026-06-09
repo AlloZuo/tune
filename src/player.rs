@@ -141,6 +141,14 @@ impl Player {
             sink.stop();
         }
 
+        // Fill in the actual duration from the decoded audio when unknown.
+        let mut track = track;
+        if track.total_duration_ms == 0 {
+            if let Some(dur) = source.total_duration() {
+                track.total_duration_ms = dur.as_millis() as u64;
+            }
+        }
+
         let sink = Sink::try_new(&self._stream_handle)?;
         sink.set_volume(self.volume);
         sink.append(source);

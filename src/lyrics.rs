@@ -101,6 +101,15 @@ pub fn extract_lyrics(data: &[u8]) -> Option<Lyrics> {
     if let Some(text) = tag.get_string(&ItemKey::Lyrics) {
         let parsed = parse_lyrics_text(text);
         if !parsed.is_empty() {
+            // Log timed lyrics range for debugging sync issues
+            if let crate::lyrics::Lyrics::Timed(ref lines) = parsed {
+                let last_ts = lines.last().map(|l| l.timestamp_ms).unwrap_or(0);
+                crate::log_error!(
+                    "提取到 LRC 歌词: {} 行, 末行时间戳={}ms",
+                    lines.len(),
+                    last_ts
+                );
+            }
             return Some(parsed);
         }
     }
@@ -111,7 +120,7 @@ pub fn extract_lyrics(data: &[u8]) -> Option<Lyrics> {
 // ── LRC parser ──
 
 /// Parse lyrics text that might be in LRC format or plain text.
-fn parse_lyrics_text(text: &str) -> Lyrics {
+pub fn parse_lyrics_text(text: &str) -> Lyrics {
     let text = text.trim();
     if text.is_empty() {
         return Lyrics::Plain(String::new());
