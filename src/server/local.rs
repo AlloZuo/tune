@@ -9,7 +9,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
 
-use crate::api::{MusicEntry, MusicServer, ServerFeatures};
+use crate::server::{MusicEntry, MusicServer, ServerFeatures};
 
 /// Try to read the audio duration (ms) from a file's metadata headers.
 /// Returns 0 on any error (silent fallback).

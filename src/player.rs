@@ -1,12 +1,16 @@
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use rand::seq::SliceRandom;
 use rand::rng;
+use rand::Rng;
+use rand::seq::SliceRandom;
 use rodio::{
     source::SeekError, Decoder, OutputStream, OutputStreamHandle, Sink, Source,
 };
+
+use crate::server::MusicEntry;
 
 // ── Playback mode ──
 
@@ -29,19 +33,19 @@ impl PlayMode {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            PlayMode::Sequential => "顺序播放",
-            PlayMode::SingleRepeat => "单曲循环",
-            PlayMode::Shuffle => "随机播放",
+            PlayMode::Sequential => crate::tf!("playmode.sequential"),
+            PlayMode::SingleRepeat => crate::tf!("playmode.single_repeat"),
+            PlayMode::Shuffle => crate::tf!("playmode.shuffle"),
         }
     }
 
-    pub fn short_label(self) -> &'static str {
+    pub fn short_label(self) -> String {
         match self {
-            PlayMode::Sequential => "顺序",
-            PlayMode::SingleRepeat => "单曲",
-            PlayMode::Shuffle => "随机",
+            PlayMode::Sequential => crate::tf!("playmode.short_sequential"),
+            PlayMode::SingleRepeat => crate::tf!("playmode.short_single"),
+            PlayMode::Shuffle => crate::tf!("playmode.short_shuffle"),
         }
     }
 }
@@ -55,9 +59,22 @@ pub struct ShuffleState {
 
 impl ShuffleState {
     /// Build a fresh shuffled queue of `count` items (indices 0..count-1).
-    pub fn new(count: usize) -> Self {
+    ///
+    /// If `exclude` is `Some`, the last element (first to be popped) is
+    /// guaranteed not to equal `exclude`, preventing immediate repeats
+    /// when reshuffling after the queue was exhausted.
+    pub fn new(count: usize, exclude: Option<usize>) -> Self {
         let mut indices: Vec<usize> = (0..count).collect();
         indices.shuffle(&mut rng());
+        if let Some(ex) = exclude {
+            if count > 1 && indices.last() == Some(&ex) {
+                // Swap the last element (which will be popped first) with
+                // a random element elsewhere, ensuring no immediate repeat.
+                let swap = rand::rng().random_range(0..count - 1);
+                let len = indices.len();
+                indices.swap(len - 1, swap);
+            }
+        }
         Self { remaining: indices }
     }
 
@@ -68,8 +85,213 @@ impl ShuffleState {
 
     /// Re-shuffle the whole set (used when the queue is exhausted).
     #[allow(dead_code)]
-    pub fn reshuffle(&mut self, count: usize) {
-        *self = Self::new(count);
+    pub fn reshuffle(&mut self, count: usize, exclude: Option<usize>) {
+        *self = Self::new(count, exclude);
+    }
+}
+
+// ── Play queue ──
+
+/// A FIFO queue of songs to play before the normal playback order resumes.
+/// When non-empty, auto-next consumes from this queue first.
+/// Once empty, the player falls back to sequential / shuffle behaviour.
+#[derive(Debug, Clone)]
+pub struct PlayQueue {
+    songs: Vec<MusicEntry>,
+}
+
+impl PlayQueue {
+    pub fn new() -> Self {
+        Self { songs: Vec::new() }
+    }
+
+    /// Append a song to the end of the queue.
+    pub fn push_back(&mut self, song: MusicEntry) {
+        self.songs.push(song);
+    }
+
+    /// Insert a song at the front of the queue ("play next").
+    pub fn push_front(&mut self, song: MusicEntry) {
+        self.songs.insert(0, song);
+    }
+
+    /// Remove and return the first item.
+    pub fn pop_front(&mut self) -> Option<MusicEntry> {
+        if self.songs.is_empty() {
+            None
+        } else {
+            Some(self.songs.remove(0))
+        }
+    }
+
+    /// Remove the item at `index`.
+    pub fn remove(&mut self, index: usize) -> Option<MusicEntry> {
+        if index < self.songs.len() {
+            Some(self.songs.remove(index))
+        } else {
+            None
+        }
+    }
+
+    /// Move the item at `index` one position earlier (towards the front).
+    pub fn move_up(&mut self, index: usize) {
+        if index > 0 && index < self.songs.len() {
+            self.songs.swap(index, index - 1);
+        }
+    }
+
+    /// Move the item at `index` one position later (towards the back).
+    pub fn move_down(&mut self, index: usize) {
+        if index + 1 < self.songs.len() {
+            self.songs.swap(index, index + 1);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.songs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.songs.is_empty()
+    }
+
+    #[allow(dead_code)]
+    pub fn clear(&mut self) {
+        self.songs.clear();
+    }
+
+    pub fn get(&self, index: usize) -> Option<&MusicEntry> {
+        self.songs.get(index)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &MusicEntry> {
+        self.songs.iter()
+    }
+
+    #[allow(dead_code)]
+    pub fn songs(&self) -> &[MusicEntry] {
+        &self.songs
+    }
+}
+
+// ── Progressive streaming buffer ──
+
+/// A shared, growable audio buffer for progressive streaming.
+///
+/// The download task calls `push()` as chunks arrive, then `set_eof()`
+/// when finished. The decoder reads via `StreamingCursor`, blocking
+/// when no data is available yet (safe because rodio runs on its own
+/// thread pool, not the tokio event loop).
+pub struct SharedAudioBuf {
+    inner: Mutex<SharedAudioBufInner>,
+    data_ready: Condvar,
+}
+
+struct SharedAudioBufInner {
+    data: Vec<u8>,
+    eof: bool,
+}
+
+impl SharedAudioBuf {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(SharedAudioBufInner {
+                data: Vec::new(),
+                eof: false,
+            }),
+            data_ready: Condvar::new(),
+        })
+    }
+
+    /// Append a chunk of data and wake any blocked reader.
+    pub fn push(&self, chunk: &[u8]) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.data.extend_from_slice(chunk);
+        self.data_ready.notify_all();
+    }
+
+    /// Mark the stream as complete. Any blocked reader will see EOF.
+    pub fn set_eof(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.eof = true;
+        self.data_ready.notify_all();
+    }
+
+    /// Total bytes received so far.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().data.len()
+    }
+}
+
+/// A `Read + Seek` wrapper around `SharedAudioBuf` for rodio's decoder.
+///
+/// `read()` blocks via condvar when no data is available, waiting for the
+/// download task to push more bytes. This is safe because rodio drives the
+/// decoder on its own background thread, not the tokio event loop.
+pub struct StreamingCursor {
+    buf: Arc<SharedAudioBuf>,
+    pos: u64,
+}
+
+impl StreamingCursor {
+    pub fn new(buf: Arc<SharedAudioBuf>) -> Self {
+        Self { buf, pos: 0 }
+    }
+}
+
+impl Read for StreamingCursor {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut guard = self.buf.inner.lock().unwrap();
+        loop {
+            if (self.pos as usize) < guard.data.len() {
+                let available = guard.data.len() - self.pos as usize;
+                let to_read = buf.len().min(available);
+                let start = self.pos as usize;
+                buf[..to_read].copy_from_slice(&guard.data[start..start + to_read]);
+                self.pos += to_read as u64;
+                return Ok(to_read);
+            }
+            if guard.eof {
+                return Ok(0);
+            }
+            // Block until more data arrives or EOF is set.
+            guard = self.buf.data_ready.wait(guard).unwrap();
+        }
+    }
+}
+
+impl Seek for StreamingCursor {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let guard = self.buf.inner.lock().unwrap();
+        let new_pos = match pos {
+            SeekFrom::Start(p) => p,
+            SeekFrom::Current(offset) => {
+                let new = self.pos as i64 + offset;
+                if new >= 0 {
+                    new as u64
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "seek before start",
+                    ));
+                }
+            }
+            SeekFrom::End(offset) => {
+                let end = guard.data.len() as i64;
+                let new = end + offset;
+                if new >= 0 {
+                    new as u64
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "seek before start",
+                    ));
+                }
+            }
+        };
+        self.pos = new_pos;
+        Ok(new_pos)
     }
 }
 
@@ -111,6 +333,13 @@ pub struct Player {
     pub play_mode: PlayMode,
     /// `None` when not in shuffle mode.
     pub shuffle_state: Option<ShuffleState>,
+
+    /// Songs queued to play next (checked before shuffle/sequential).
+    pub queue: PlayQueue,
+
+    /// When `Some`, progressive streaming is in progress and the player is
+    /// already consuming audio from this buffer while the download continues.
+    pub streaming_buf: Option<Arc<SharedAudioBuf>>,
 }
 
 impl Player {
@@ -127,21 +356,81 @@ impl Player {
             seek_offset_ms: 0,
             play_mode: PlayMode::Sequential,
             shuffle_state: None,
+            queue: PlayQueue::new(),
+            streaming_buf: None,
         })
     }
 
-    /// Load and play audio from raw bytes.
-    pub fn play_bytes(&mut self, data: Vec<u8>, track: TrackInfo) -> Result<()> {
+    /// Async version: decode audio in a blocking thread pool to avoid
+    /// blocking the async runtime during CPU-intensive symphonia decode.
+    pub async fn play_bytes_async(&mut self, data: Vec<u8>, track: TrackInfo) -> Result<()> {
         self.audio_data = Some(data.clone());
 
-        let cursor = Cursor::new(data);
+        let (source, decoded_duration) = {
+            let result: Result<(rodio::Decoder<Cursor<Vec<u8>>>, Option<Duration>)> =
+                tokio::task::spawn_blocking(move || {
+                    let cursor = Cursor::new(data);
+                    let source = Decoder::new(cursor)?;
+                    let dur = source.total_duration();
+                    Ok::<_, anyhow::Error>((source, dur))
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("decode task panicked: {}", e))?;
+            result?
+        };
+
+        if let Some(sink) = &self.sink {
+            sink.stop();
+        }
+
+        let mut track = track;
+        if track.total_duration_ms == 0 {
+            if let Some(dur) = decoded_duration {
+                track.total_duration_ms = dur.as_millis() as u64;
+            }
+        }
+
+        let sink = Sink::try_new(&self._stream_handle)?;
+        sink.set_volume(self.volume);
+        sink.append(source);
+
+        self.sink = Some(sink);
+        self.seek_offset_ms = 0;
+        self.state = PlayerState::Playing;
+        self.current_track = Some(track);
+        self.streaming_buf = None;
+        Ok(())
+    }
+
+    /// Start playing from a progressive stream. The `SharedAudioBuf` is
+    /// shared with a background download task that keeps pushing bytes.
+    ///
+    /// The decoder blocks on `read()` when no data is available, which is
+    /// safe because rodio drives the decoder on its own thread.
+    pub fn play_streaming(&mut self, buf: Arc<SharedAudioBuf>, track: TrackInfo) -> Result<()> {
+        // Wait for at least 256 KB of initial data so the decoder can
+        // parse headers and start playing.  This blocks the current thread
+        // (the main event loop), so the download task must already be
+        // running by the time we get here.
+        const MIN_BYTES: usize = 256 * 1024;
+        {
+            let guard = buf.inner.lock().unwrap();
+            let guard = buf
+                .data_ready
+                .wait_while(guard, |state| state.data.len() < MIN_BYTES && !state.eof)
+                .map_err(|_| anyhow::anyhow!("等待下载数据时出错"))?;
+            if guard.data.is_empty() {
+                anyhow::bail!("没有收到音频数据，下载可能失败");
+            }
+        }
+
+        let cursor = StreamingCursor::new(buf.clone());
         let source = Decoder::new(cursor)?;
 
         if let Some(sink) = &self.sink {
             sink.stop();
         }
 
-        // Fill in the actual duration from the decoded audio when unknown.
         let mut track = track;
         if track.total_duration_ms == 0 {
             if let Some(dur) = source.total_duration() {
@@ -157,17 +446,59 @@ impl Player {
         self.seek_offset_ms = 0;
         self.state = PlayerState::Playing;
         self.current_track = Some(track);
+        self.streaming_buf = Some(buf);
+        // Don't overwrite `audio_data` — it will be set later via
+        // `finalize_streaming()` once the download completes.
         Ok(())
     }
 
-    // ── Seek ──
+    /// Called when the progressive download has finished.
+    /// Stores the full audio data (for seeking) and updates lyrics.
+    /// Update lyrics on the current track after playback has started.
+    /// Used when lyrics arrive asynchronously (LyricsReady message).
+    pub fn set_lyrics(&mut self, lyrics: Option<Lyrics>) {
+        if let Some(ref mut track) = self.current_track {
+            if lyrics.is_some() {
+                track.lyrics = lyrics;
+            }
+        }
+    }
 
+    pub fn finalize_streaming(&mut self, data: Vec<u8>, lyrics: Option<Lyrics>) {
+        self.audio_data = Some(data);
+        if let Some(ref mut track) = self.current_track {
+            if lyrics.is_some() {
+                track.lyrics = lyrics;
+            }
+        }
+        self.streaming_buf = None;
+    }
+
+    // ── Seek ──
     /// Seek to an absolute position in milliseconds.
     pub fn seek_to_ms(&mut self, pos_ms: u64) -> Result<()> {
-        let data = self
-            .audio_data
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("没有可 seek 的音频数据"))?;
+        let data = if let Some(ref buf) = self.streaming_buf {
+            // If the download is still in progress, wait for it to complete
+            // so we have the full file for re-decoding.
+            let mut guard = buf.inner.lock().unwrap();
+            if !guard.eof {
+                // Block until EOF so we can re-decode from scratch.
+                guard = buf
+                    .data_ready
+                    .wait_while(guard, |state| !state.eof)
+                    .map_err(|_| anyhow::anyhow!("等待下载完成时出错"))?;
+            }
+            let full = guard.data.clone();
+            drop(guard);
+            self.audio_data = Some(full.clone());
+            self.streaming_buf = None;
+            full
+        } else {
+            self.audio_data
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("没有可 seek 的音频数据"))?
+        };
+
         let total = self
             .current_track
             .as_ref()
@@ -206,12 +537,127 @@ impl Player {
         Ok(())
     }
 
-    /// Seek relative to current position (positive = forward, negative = backward).
-    pub fn seek_relative(&mut self, delta_secs: i64) -> Result<()> {
-        let cur = self.position_ms() as i64;
-        let new = (cur + delta_secs * 1000).max(0) as u64;
-        self.seek_to_ms(new)
+    /// Async seek: decode audio in a blocking thread pool to avoid
+    /// blocking the async runtime during re-decoding for seek.
+    pub async fn seek_to_ms_async(&mut self, pos_ms: u64) -> Result<()> {
+        let data = if let Some(ref buf) = self.streaming_buf {
+            let mut guard = buf.inner.lock().unwrap();
+            if !guard.eof {
+                guard = buf
+                    .data_ready
+                    .wait_while(guard, |state| !state.eof)
+                    .map_err(|_| anyhow::anyhow!("等待下载完成时出错"))?;
+            }
+            let full = guard.data.clone();
+            drop(guard);
+            self.audio_data = Some(full.clone());
+            self.streaming_buf = None;
+            full
+        } else {
+            self.audio_data
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("没有可 seek 的音频数据"))?
+        };
+
+        let total = self
+            .current_track
+            .as_ref()
+            .map(|t| t.total_duration_ms)
+            .unwrap_or(0);
+        let pos_ms = pos_ms.min(total.saturating_sub(200));
+        let seek_dur = Duration::from_millis(pos_ms);
+
+        let data_for_fallback = data.clone();
+        let seeked_source: Box<dyn Source<Item = i16> + Send> =
+            {
+                let result: Result<Box<dyn Source<Item = i16> + Send>> =
+                    tokio::task::spawn_blocking(move || {
+                        let cursor = Cursor::new(data);
+                        let mut source = Decoder::new(cursor)?;
+
+                        let seeked: Box<dyn Source<Item = i16> + Send> =
+                            match source.try_seek(seek_dur) {
+                                Ok(()) => Box::new(source),
+                                Err(SeekError::NotSupported { .. }) => {
+                                    let cursor2 = Cursor::new(data_for_fallback);
+                                    let source2 = Decoder::new(cursor2)?;
+                                    Box::new(source2.skip_duration(seek_dur))
+                                }
+                                Err(_) => anyhow::bail!("seek 失败"),
+                            };
+                        Ok::<_, anyhow::Error>(seeked)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("seek 任务异常: {}", e))?;
+                result?
+            };
+
+        if let Some(sink) = &self.sink {
+            sink.stop();
+        }
+        let sink = Sink::try_new(&self._stream_handle)?;
+        sink.set_volume(self.volume);
+        sink.append(seeked_source);
+
+        self.sink = Some(sink);
+        self.seek_offset_ms = pos_ms;
+        self.state = PlayerState::Playing;
+        Ok(())
     }
+
+    /// Extract raw audio data for a non-blocking seek.
+    /// Returns `(audio_data, clamped_pos_ms)` or `None` if no data available.
+    /// After calling this, the stream buffer (if any) is consumed and stored
+    /// into `audio_data`. The caller should spawn `decode_seek_source()` on a
+    /// blocking thread and then call `apply_seek_source()` when done.
+    pub fn extract_seek_data(&mut self, delta_secs: i64) -> Option<(Vec<u8>, u64)> {
+        let cur = self.position_ms() as i64;
+        let raw_pos = (cur + delta_secs * 1000).max(0) as u64;
+
+        let data = if let Some(ref buf) = self.streaming_buf {
+            let guard = buf.inner.lock().ok()?;
+            if !guard.eof {
+                return None; // streaming not done yet — can't seek
+            }
+            let full = guard.data.clone();
+            drop(guard);
+            self.audio_data = Some(full.clone());
+            self.streaming_buf = None;
+            full
+        } else {
+            self.audio_data.clone()?
+        };
+
+        let total = self
+            .current_track
+            .as_ref()
+            .map(|t| t.total_duration_ms)
+            .unwrap_or(0);
+        let pos_ms = raw_pos.min(total.saturating_sub(200));
+
+        Some((data, pos_ms))
+    }
+
+    /// Apply a pre-decoded seek source to the player's sink.
+    /// Call this on the main loop when `SeekPrepared` is received.
+    pub fn apply_seek_source(
+        &mut self,
+        source: Box<dyn Source<Item = i16> + Send>,
+        pos_ms: u64,
+    ) {
+        if let Some(sink) = &self.sink {
+            sink.stop();
+        }
+        if let Ok(sink) = Sink::try_new(&self._stream_handle) {
+            sink.set_volume(self.volume);
+            sink.append(source);
+            self.sink = Some(sink);
+        }
+        self.seek_offset_ms = pos_ms;
+        self.state = PlayerState::Playing;
+    }
+
+
 
     // ── Playback control ──
 
@@ -241,6 +687,7 @@ impl Player {
         self.current_track = None;
         self.audio_data = None;
         self.seek_offset_ms = 0;
+        self.streaming_buf = None;
     }
 
     pub fn toggle_playback(&mut self) {
@@ -275,7 +722,7 @@ impl Player {
     #[allow(dead_code)]
     pub fn init_shuffle(&mut self, list_len: usize) {
         if self.play_mode == PlayMode::Shuffle {
-            self.shuffle_state = Some(ShuffleState::new(list_len.max(1)));
+            self.shuffle_state = Some(ShuffleState::new(list_len.max(1), None));
         }
     }
 
@@ -319,5 +766,236 @@ impl Player {
 
     pub fn has_audio_data(&self) -> bool {
         self.audio_data.is_some()
+    }
+}
+
+// ── Non-blocking seek: decode in blocking thread pool ──
+
+/// Decode audio data and seek to the given position.
+/// Runs CPU-intensive symphonia decode on a blocking thread.
+/// Returns a decoded source ready for `Sink::append`.
+pub async fn decode_seek_source(
+    data: Vec<u8>,
+    pos_ms: u64,
+) -> Result<Box<dyn Source<Item = i16> + Send>> {
+    let data_for_fallback = data.clone();
+    let seek_dur = Duration::from_millis(pos_ms);
+
+    let result: Result<Box<dyn Source<Item = i16> + Send>> =
+        tokio::task::spawn_blocking(move || {
+            let cursor = Cursor::new(data);
+            let mut source = Decoder::new(cursor)?;
+
+            let seeked: Box<dyn Source<Item = i16> + Send> = match source.try_seek(seek_dur) {
+                Ok(()) => Box::new(source),
+                Err(SeekError::NotSupported { .. }) => {
+                    let cursor2 = Cursor::new(data_for_fallback);
+                    let source2 = Decoder::new(cursor2)?;
+                    Box::new(source2.skip_duration(seek_dur))
+                }
+                Err(_) => anyhow::bail!("seek 失败"),
+            };
+            Ok::<_, anyhow::Error>(seeked)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("seek 任务异常: {}", e))?;
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::MusicEntry;
+
+    fn make_song(id: u64, name: &str) -> MusicEntry {
+        MusicEntry {
+            id,
+            absolute_path: format!("/music/{}.mp3", name),
+            name: name.to_string(),
+            artist: "test".to_string(),
+            duration: 200_000,
+            size: 1000,
+            server_id: "test-server".to_string(),
+        }
+    }
+
+    // ── PlayQueue ──
+
+    #[test]
+    fn test_queue_new_is_empty() {
+        let q = PlayQueue::new();
+        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn test_push_back_and_pop_front() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        q.push_back(make_song(2, "B"));
+        assert_eq!(q.len(), 2);
+
+        let a = q.pop_front().unwrap();
+        assert_eq!(a.name, "A");
+        assert_eq!(q.len(), 1);
+
+        let b = q.pop_front().unwrap();
+        assert_eq!(b.name, "B");
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn test_push_front_play_next() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        q.push_front(make_song(2, "B"));
+        // B should be first (play next)
+        assert_eq!(q.pop_front().unwrap().name, "B");
+        assert_eq!(q.pop_front().unwrap().name, "A");
+    }
+
+    #[test]
+    fn test_pop_front_empty_returns_none() {
+        let mut q = PlayQueue::new();
+        assert!(q.pop_front().is_none());
+    }
+
+    #[test]
+    fn test_remove_by_index() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        q.push_back(make_song(2, "B"));
+        q.push_back(make_song(3, "C"));
+
+        let b = q.remove(1).unwrap();
+        assert_eq!(b.name, "B");
+        assert_eq!(q.len(), 2);
+
+        // Remaining: A, C
+        assert_eq!(q.get(0).unwrap().name, "A");
+        assert_eq!(q.get(1).unwrap().name, "C");
+    }
+
+    #[test]
+    fn test_remove_out_of_bounds_returns_none() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        assert!(q.remove(5).is_none());
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn test_move_up() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        q.push_back(make_song(2, "B"));
+        q.push_back(make_song(3, "C"));
+
+        q.move_up(2); // C → [A, C, B]
+        assert_eq!(q.get(0).unwrap().name, "A");
+        assert_eq!(q.get(1).unwrap().name, "C");
+        assert_eq!(q.get(2).unwrap().name, "B");
+
+        q.move_up(1); // C → [C, A, B]
+        assert_eq!(q.get(0).unwrap().name, "C");
+    }
+
+    #[test]
+    fn test_move_up_first_element_does_nothing() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        q.push_back(make_song(2, "B"));
+        q.move_up(0); // A is already first
+        assert_eq!(q.get(0).unwrap().name, "A");
+        assert_eq!(q.get(1).unwrap().name, "B");
+    }
+
+    #[test]
+    fn test_move_down() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        q.push_back(make_song(2, "B"));
+        q.push_back(make_song(3, "C"));
+
+        q.move_down(0); // A → [B, A, C]
+        assert_eq!(q.get(0).unwrap().name, "B");
+        assert_eq!(q.get(1).unwrap().name, "A");
+        assert_eq!(q.get(2).unwrap().name, "C");
+    }
+
+    #[test]
+    fn test_move_down_last_element_does_nothing() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        q.push_back(make_song(2, "B"));
+        q.move_down(1);
+        assert_eq!(q.get(0).unwrap().name, "A");
+        assert_eq!(q.get(1).unwrap().name, "B");
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        q.push_back(make_song(2, "B"));
+        q.clear();
+        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn test_get_and_iter() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        q.push_back(make_song(2, "B"));
+
+        assert_eq!(q.get(0).unwrap().name, "A");
+        assert_eq!(q.get(1).unwrap().name, "B");
+        assert!(q.get(2).is_none());
+
+        let names: Vec<&str> = q.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn test_fifo_order() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "X"));
+        q.push_back(make_song(2, "Y"));
+        q.push_back(make_song(3, "Z"));
+
+        assert_eq!(q.pop_front().unwrap().name, "X");
+        assert_eq!(q.pop_front().unwrap().name, "Y");
+        assert_eq!(q.pop_front().unwrap().name, "Z");
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn test_push_front_after_push_back() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        q.push_back(make_song(2, "B"));
+        q.push_front(make_song(3, "C")); // C jumps ahead of A
+
+        assert_eq!(q.pop_front().unwrap().name, "C");
+        assert_eq!(q.pop_front().unwrap().name, "A");
+        assert_eq!(q.pop_front().unwrap().name, "B");
+    }
+
+    #[test]
+    fn test_interleaved_add_remove() {
+        let mut q = PlayQueue::new();
+        q.push_back(make_song(1, "A"));
+        q.push_back(make_song(2, "B"));
+        q.pop_front(); // remove A
+        q.push_back(make_song(3, "C"));
+        q.push_front(make_song(4, "D")); // D jumps to front
+
+        // Queue: D, B, C
+        assert_eq!(q.pop_front().unwrap().name, "D");
+        assert_eq!(q.pop_front().unwrap().name, "B");
+        assert_eq!(q.pop_front().unwrap().name, "C");
+        assert!(q.is_empty());
     }
 }

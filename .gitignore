@@ -2,3 +2,6 @@
 *.txt
 listen_config.json
 listen_playlists.json
+.omo/
+tests/
+TODO.md

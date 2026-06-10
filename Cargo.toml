@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rodio = "0.19"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -16,3 +16,4 @@ anyhow = "1"
 async-trait = "0.1"
 rand = "0.9"
 lofty = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }

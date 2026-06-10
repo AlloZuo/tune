@@ -7,6 +7,10 @@ use std::time::Duration;
 
 use crate::lyrics::Lyrics;
 
+pub mod file_transfer;
+pub mod local;
+pub mod navidrome;
+
 /// Shared HTTP client with a 15-second timeout per request.
 pub(crate) static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -150,81 +154,21 @@ pub trait MusicServer: Send + Sync {
     }
 }
 
-// ── 文件闪传 (Fast File Transfer) adapter ──
-
-/// Adapter for the 文件闪传 mobile app server.
-///
-/// Endpoints:
-/// - `GET {base}/musicsV2` → `{ children: [...] }`
-/// - `GET {base}/file?path={encoded_path}` → audio stream
-pub struct FileTransferServer {
-    base_url: String,
-}
-
-impl FileTransferServer {
-    pub fn new(base_url: &str) -> Self {
-        Self { base_url: base_url.to_string() }
-    }
-}
-
-#[async_trait]
-impl MusicServer for FileTransferServer {
-    fn name(&self) -> &str {
-        "文件闪传"
-    }
-
-    fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    async fn fetch_list(&self) -> Result<Vec<MusicEntry>> {
-        let url = format!("{}/musicsV2", self.base_url);
-        let resp: MusicListResponse = HTTP.get(&url).send().await?.json().await?;
-        Ok(resp.children)
-    }
-
-    fn stream_url(&self, music: &MusicEntry) -> String {
-        let encoded_path = encode_url_path(&music.absolute_path);
-        format!("{}/file?path={}", self.base_url, encoded_path)
-    }
-}
-
-fn encode_url_path(path: &str) -> String {
-    path.split('/')
-        .map(|segment| {
-            let mut encoded = String::new();
-            for byte in segment.bytes() {
-                match byte {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                        encoded.push(byte as char);
-                    }
-                    b' ' => encoded.push_str("%20"),
-                    _ => {
-                        encoded.push_str(&format!("%{:02X}", byte));
-                    }
-                }
-            }
-            encoded
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 // ── Factory ──
 
 /// Create a single server adapter from a `ServerConfig`.
 fn create_server(config: &ServerConfig) -> Arc<dyn MusicServer> {
     match config.server_type.as_str() {
-        "file-transfer" => Arc::new(FileTransferServer::new(&config.server_url)),
+        "file-transfer" => Arc::new(crate::server::file_transfer::FileTransferServer::new(&config.server_url)),
         "navidrome" | "subsonic" => {
-            Arc::new(crate::navidrome::SubsonicServer::new(
+            Arc::new(crate::server::navidrome::SubsonicServer::new(
                 &config.server_url,
                 &config.username,
                 &config.password,
             ))
         }
-        "local" => Arc::new(crate::local::LocalServer::new(&config.server_url)),
-        _ => Arc::new(FileTransferServer::new(&config.server_url)),
+        "local" => Arc::new(crate::server::local::LocalServer::new(&config.server_url)),
+        _ => Arc::new(crate::server::file_transfer::FileTransferServer::new(&config.server_url)),
     }
 }
 
@@ -232,7 +176,7 @@ fn create_server(config: &ServerConfig) -> Arc<dyn MusicServer> {
 /// Returns a single `FileTransferServer` if the list is empty (fallback).
 pub fn create_server_pool(configs: &[ServerConfig]) -> Arc<dyn MusicServer> {
     if configs.is_empty() {
-        return Arc::new(FileTransferServer::new(""));
+        return Arc::new(crate::server::file_transfer::FileTransferServer::new(""));
     }
     let servers: Vec<(String, bool, Arc<dyn MusicServer>)> = configs
         .iter()
