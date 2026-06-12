@@ -7,7 +7,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::server::{MusicEntry, MusicListResponse, MusicServer, HTTP};
+use crate::server::{encode_url_component, MusicEntry, MusicListResponse, MusicServer, HTTP};
 
 /// Adapter for the 文件闪传 mobile app server.
 pub struct FileTransferServer {
@@ -46,21 +46,7 @@ impl MusicServer for FileTransferServer {
 
 fn encode_url_path(path: &str) -> String {
     path.split('/')
-        .map(|segment| {
-            let mut encoded = String::new();
-            for byte in segment.bytes() {
-                match byte {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                        encoded.push(byte as char);
-                    }
-                    b' ' => encoded.push_str("%20"),
-                    _ => {
-                        encoded.push_str(&format!("%{:02X}", byte));
-                    }
-                }
-            }
-            encoded
-        })
+        .map(encode_url_component)
         .collect::<Vec<_>>()
         .join("/")
 }

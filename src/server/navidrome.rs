@@ -91,6 +91,7 @@ impl SubsonicServer {
                 absolute_path: s.id,
                 name: s.title,
                 artist: s.artist.clone().unwrap_or_else(|| album.artist.clone()),
+                album: album.name.clone(),
                 // Subsonic API returns duration in seconds; convert to ms
                 duration: s.duration * 1000,
                 size: 0,
@@ -204,6 +205,8 @@ struct SubsonicSong {
     #[serde(default)]
     duration: u64,
     artist: Option<String>,
+    #[serde(default)]
+    album: Option<String>,
 }
 
 // ── Trait implementation ──
@@ -304,6 +307,7 @@ impl MusicServer for SubsonicServer {
                 absolute_path: s.id,
                 name: s.title,
                 artist: s.artist.unwrap_or_default(),
+                album: s.album.unwrap_or_default(),
                 // Subsonic API returns duration in seconds; convert to ms
                 duration: s.duration * 1000,
                 size: 0,
@@ -322,8 +326,8 @@ impl MusicServer for SubsonicServer {
     }
 
     async fn fetch_lyrics(&self, music: &MusicEntry) -> Option<Lyrics> {
-        let artist = urlencoding(&music.artist);
-        let title = urlencoding(&music.name);
+        let artist = crate::server::encode_url_component(&music.artist);
+        let title = crate::server::encode_url_component(&music.name);
         let url = format!(
             "{}/rest/getLyrics?artist={}&title={}&{}",
             self.base_url,
@@ -355,21 +359,4 @@ impl MusicServer for SubsonicServer {
         }
         Some(parsed)
     }
-}
-
-/// Simple URL encoding for query parameters (only encodes special chars).
-fn urlencoding(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            b' ' => out.push_str("%20"),
-            _ => {
-                out.push_str(&format!("%{:02X}", b));
-            }
-        }
-    }
-    out
 }

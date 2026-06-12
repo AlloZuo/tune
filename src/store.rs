@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::sync::{LazyLock, RwLock};
 
 use crate::server::{MusicEntry, ServerConfig};
 use crate::ui::Playlist;
@@ -7,6 +8,16 @@ use crate::ui::Playlist;
 /// Single unified config file — replaces the old separate files for servers,
 /// playlists, and language.
 const CONFIG_FILE: &str = "tune_config.json";
+
+// ── In-memory config cache ──
+//
+// Loaded once at startup (with migrations), then all load/save operations
+// read/write this cache. On-disk writes happen on every mutation for
+// crash-safety but reads are zero-I/O.
+
+static CONFIG: LazyLock<RwLock<TuneConfig>> = LazyLock::new(|| {
+    RwLock::new(load_config_from_disk())
+});
 
 // ── Unified config structure ──
 
@@ -34,9 +45,9 @@ pub struct TuneConfig {
     pub default_volume: Option<f64>,
 }
 
-/// Load the unified config from disk with migration from old formats.
+/// Load the config from disk (with migrations). Called once at startup.
 /// Never fails — returns defaults on any error.
-fn load_config() -> TuneConfig {
+fn load_config_from_disk() -> TuneConfig {
     let content = match std::fs::read_to_string(CONFIG_FILE) {
         Ok(c) => c,
         Err(_) => {
@@ -100,7 +111,10 @@ fn load_config() -> TuneConfig {
 
 fn save_config_inner(cfg: &TuneConfig) -> Result<()> {
     let json = serde_json::to_string_pretty(cfg)?;
-    std::fs::write(CONFIG_FILE, json)?;
+    // Write to temp file, then rename — prevents corruption on crash.
+    let tmp = format!("{}.tmp", CONFIG_FILE);
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, CONFIG_FILE)?;
     Ok(())
 }
 
@@ -164,7 +178,7 @@ struct PlaylistJsonLegacy {
     songs: Vec<MusicEntry>,
 }
 
-// ── Public API (kept for backward compatibility) ──
+// ── Public API ──
 
 impl Default for TuneConfig {
     fn default() -> Self {
@@ -181,40 +195,44 @@ impl Default for TuneConfig {
 const DEFAULT_VOLUME: f64 = 0.8;
 
 pub fn load_volume() -> f32 {
-    load_config()
+    CONFIG
+        .read()
+        .unwrap()
         .default_volume
         .unwrap_or(DEFAULT_VOLUME) as f32
 }
 
 pub fn save_volume(vol: f32) -> Result<()> {
-    let mut cfg = load_config();
+    let mut cfg = CONFIG.write().unwrap();
     cfg.default_volume = Some((vol as f64).clamp(0.0, 1.0));
     save_config_inner(&cfg)
 }
 
 pub fn load_servers() -> Vec<ServerConfig> {
-    load_config().servers
+    CONFIG.read().unwrap().servers.clone()
 }
 
 pub fn save_servers(servers: &[ServerConfig]) -> Result<()> {
-    let mut cfg = load_config();
+    let mut cfg = CONFIG.write().unwrap();
     cfg.servers = servers.to_vec();
     save_config_inner(&cfg)
 }
 
 pub fn load_playlists() -> Vec<Playlist> {
-    let cfg = load_config();
-    cfg.playlists
-        .into_iter()
+    CONFIG
+        .read()
+        .unwrap()
+        .playlists
+        .iter()
         .map(|pj| Playlist {
-            name: pj.name,
-            songs: pj.songs,
+            name: pj.name.clone(),
+            songs: pj.songs.clone(),
         })
         .collect()
 }
 
 pub fn save_playlists(playlists: &[Playlist]) -> Result<()> {
-    let mut cfg = load_config();
+    let mut cfg = CONFIG.write().unwrap();
     cfg.playlists = playlists
         .iter()
         .map(|p| PlaylistJson {
@@ -226,27 +244,27 @@ pub fn save_playlists(playlists: &[Playlist]) -> Result<()> {
 }
 
 pub fn load_language() -> String {
-    load_config().language
+    CONFIG.read().unwrap().language.clone()
 }
 
 pub fn save_language(lang: &str) -> Result<()> {
-    let mut cfg = load_config();
+    let mut cfg = CONFIG.write().unwrap();
     cfg.language = lang.to_string();
     save_config_inner(&cfg)
 }
 
 pub fn load_last_played() -> Option<LastPlayed> {
-    load_config().last_played
+    CONFIG.read().unwrap().last_played.clone()
 }
 
 pub fn save_last_played(last: &LastPlayed) -> Result<()> {
-    let mut cfg = load_config();
+    let mut cfg = CONFIG.write().unwrap();
     cfg.last_played = Some(last.clone());
     save_config_inner(&cfg)
 }
 
 pub fn clear_last_played() -> Result<()> {
-    let mut cfg = load_config();
+    let mut cfg = CONFIG.write().unwrap();
     cfg.last_played = None;
     save_config_inner(&cfg)
 }

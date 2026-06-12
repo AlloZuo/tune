@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -10,7 +12,7 @@ use ratatui::{
 
 use crate::player::PlayerState;
 
-use super::{App, PlayingSource, SortMode, ViewMode};
+use super::{App, DisplayItem, PlayingSource, SortMode, ViewMode};
 
 // ──────────────────────────────────────────────
 // Rendering entry point
@@ -116,32 +118,61 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_music_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let selected = app.list_state.selected();
+    let is_grouped = app.sort_mode == SortMode::Album;
+
     let items: Vec<ListItem> = app
-        .filtered_music
+        .display_items
         .iter()
         .enumerate()
-        .map(|(i, music)| {
-            let is_selected = Some(i) == selected;
-            let name = music.name.clone();
-            let artist = if music.artist == "<unknown>" || music.artist.is_empty() {
-                crate::tf!("app.unknown_artist")
-            } else {
-                music.artist.clone()
-            };
-            let dur = format_duration(music.duration);
+        .map(|(i, item)| match item {
+            DisplayItem::Song(data_idx) => {
+                let music = &app.filtered_music[*data_idx];
+                let is_selected = Some(i) == selected;
+                let name = music.name.clone();
+                let artist = if music.artist == "<unknown>" || music.artist.is_empty() {
+                    crate::tf!("app.unknown_artist")
+                } else {
+                    music.artist.clone()
+                };
+                let dur = format_duration(music.duration);
 
-            let content = Line::from(vec![
-                Span::styled(name, Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled(artist, Style::new().fg(Color::DarkGray)),
-                Span::raw("  "),
-                Span::styled(dur, Style::new().fg(Color::Gray)),
-            ]);
+                let mut spans = vec![
+                    Span::styled(name, Style::new().add_modifier(Modifier::BOLD)),
+                    Span::raw("  "),
+                    Span::styled(artist, Style::new().fg(Color::DarkGray)),
+                    Span::raw("  "),
+                    Span::styled(dur, Style::new().fg(Color::Gray)),
+                ];
+                // Show album name in non-grouped mode too
+                if !is_grouped && !music.album.is_empty() {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        music.album.clone(),
+                        Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    ));
+                }
 
-            if is_selected {
-                ListItem::new(content).style(Style::new().bg(Color::Blue).fg(Color::White))
-            } else {
-                ListItem::new(content)
+                let content = Line::from(spans);
+
+                if is_selected {
+                    ListItem::new(content).style(Style::new().bg(Color::Blue).fg(Color::White))
+                } else {
+                    ListItem::new(content)
+                }
+            }
+            DisplayItem::AlbumHeader {
+                album,
+                artist,
+                song_count,
+            } => {
+                let header_text = format!("  {}  —  {}  ({}首)", album, artist, song_count);
+                let content = Line::from(vec![Span::styled(
+                    header_text,
+                    Style::new()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )]);
+                ListItem::new(content).style(Style::new().bg(Color::Black))
             }
         })
         .collect();
@@ -149,13 +180,31 @@ fn render_music_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = if app.search_query.is_empty() {
         format!(" {} ({}) ", crate::t!("view.browse"), items.len())
     } else {
-        format!(" {} ", crate::tf!("view.search_results", &app.search_query, items.len()))
+        format!(
+            " {} ",
+            crate::tf!("view.search_results", &app.search_query, items.len())
+        )
+    };
+
+    let title = if let Some(ref artist) = app.artist_filter {
+        format!("{} — {}: {} ", title.trim(), crate::t!("misc.filter_artist"), artist)
+    } else {
+        title
+    };
+
+    // Add sort mode and grouping badge
+    let title = if is_grouped {
+        format!("{} [{}] ", title.trim(), crate::t!("sort.album"))
+    } else if app.sort_mode != SortMode::Default {
+        format!("{} [{}] ", title.trim(), app.sort_mode.label())
+    } else {
+        title
     };
 
     let list = List::new(items)
         .block(
             Block::default()
-                .title(title)
+                .title(title.trim())
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(Color::Cyan)),
@@ -504,81 +553,57 @@ fn render_create_playlist_overlay(frame: &mut Frame, area: Rect, _app: &App) {
     frame.render_widget(input, overlay_area);
 }
 
+fn build_help_lines() -> Vec<String> {
+    let box_w = "══════════════════════════════════════";
+    vec![
+        format!("╔{}╗", box_w),
+        format!("║{:^38}║", crate::t!("help.title")),
+        format!("╠{}╣", box_w),
+        format!("║  {}  ║", crate::t!("help.playback_header")),
+        format!("║  Enter       {}  ║", crate::t!("help.play")),
+        format!("║  Space       {}  ║", crate::t!("help.toggle")),
+        format!("║  s           {}  ║", crate::t!("help.stop")),
+        format!("║  ← / →       {}  ║", crate::t!("help.seek")),
+        format!("║  n           {}  ║", crate::t!("help.next_track")),
+        format!("║  m           {}  ║", crate::t!("help.play_mode")),
+        format!("║  + / =       {}  ║", crate::t!("help.volume")),
+        format!("║  - / _        {}  ║", ""),
+        format!("║  {}  ║", crate::t!("help.nav_header")),
+        format!("║  ↑ / ↓       {}  ║", crate::t!("help.nav_up_down")),
+        format!("║  PgUp/PgDn   {}  ║", crate::t!("help.nav_page")),
+        format!("║  g           {}  ║", crate::t!("help.goto_playing")),
+        format!("║  /           {}  ║", crate::t!("help.search")),
+        format!("║  f / F       {}  ║", crate::t!("help.filter_artist")),
+        format!("║  {}  ║", crate::t!("help.queue_header")),
+        format!("║  x           {}  ║", crate::t!("help.queue_play_next")),
+        format!("║  w           {}  ║", crate::t!("help.queue_add")),
+        format!("║  u           {}  ║", crate::t!("help.queue_view")),
+        format!("║  {}  ║", crate::t!("help.playlist_header")),
+        format!("║  a           {}  ║", crate::t!("help.playlist_add")),
+        format!("║  l           {}  ║", crate::t!("help.playlist_manage")),
+        format!("║  c           {}  ║", crate::t!("help.playlist_create")),
+        format!("║  d           {}  ║", crate::t!("help.playlist_delete")),
+        format!("║  {}  ║", crate::t!("help.system_header")),
+        format!("║  r           {}  ║", crate::t!("help.refresh")),
+        format!("║  R           {}  ║", crate::t!("help.config")),
+        format!("║  L           {}  ║", crate::t!("help.language")),
+        format!("║  h / ?       {}  ║", crate::t!("help.help")),
+        format!("║  q / Esc     {}  ║", crate::t!("help.quit")),
+        format!("╚{}╝", box_w),
+    ]
+}
+
+static HELP_EN: LazyLock<Vec<String>> = LazyLock::new(build_help_lines);
+static HELP_ZH: LazyLock<Vec<String>> = LazyLock::new(build_help_lines);
+
 fn render_help_overlay(frame: &mut Frame, area: Rect, _app: &App) {
-    let overlay_area = centered_rect_lines(27, area);
+    let overlay_area = centered_rect_lines(35, area);
     frame.render_widget(Clear, overlay_area);
 
-    let box_w = "══════════════════════════════════════";
-    let help_text: Vec<String> = if crate::i18n::current() == crate::i18n::Language::En {
-        vec![
-            format!("╔{}╗", box_w),
-            format!("║{:^38}║", crate::t!("help.title")),
-            format!("╠{}╣", box_w),
-            format!("║  {}  ║", crate::t!("help.playback_header")),
-            format!("║  Enter       {}  ║", crate::t!("help.play")),
-            format!("║  Space       {}  ║", crate::t!("help.toggle")),
-            format!("║  s           {}  ║", crate::t!("help.stop")),
-            format!("║  ← / →       {}  ║", crate::t!("help.seek")),
-            format!("║  m           {}  ║", crate::t!("help.play_mode")),
-            format!("║  + / =       {}  ║", crate::t!("help.volume")),
-            format!("║  - / _        {}  ║", ""),
-            format!("║  {}  ║", crate::t!("help.nav_header")),
-            format!("║  ↑ / ↓       {}  ║", crate::t!("help.nav_up_down")),
-            format!("║  PgUp/PgDn   {}  ║", crate::t!("help.nav_page")),
-            format!("║  g           {}  ║", crate::t!("help.goto_playing")),
-            format!("║  /           {}  ║", crate::t!("help.search")),
-            format!("║  {}  ║", crate::t!("help.queue_header")),
-            format!("║  x           {}  ║", crate::t!("help.queue_play_next")),
-            format!("║  w           {}  ║", crate::t!("help.queue_add")),
-            format!("║  u           {}  ║", crate::t!("help.queue_view")),
-            format!("║  {}  ║", crate::t!("help.playlist_header")),
-            format!("║  a           {}  ║", crate::t!("help.playlist_add")),
-            format!("║  l           {}  ║", crate::t!("help.playlist_manage")),
-            format!("║  c           {}  ║", crate::t!("help.playlist_create")),
-            format!("║  d           {}  ║", crate::t!("help.playlist_delete")),
-            format!("║  {}  ║", crate::t!("help.system_header")),
-            format!("║  r           {}  ║", crate::t!("help.refresh")),
-            format!("║  R           {}  ║", crate::t!("help.config")),
-            format!("║  L           {}  ║", crate::t!("help.language")),
-            format!("║  h / ?       {}  ║", crate::t!("help.help")),
-            format!("║  q / Esc     {}  ║", crate::t!("help.quit")),
-            format!("╚{}╝", box_w),
-        ]
+    let help_text = if crate::i18n::current() == crate::i18n::Language::En {
+        &*HELP_EN
     } else {
-        vec![
-            format!("╔{}╗", box_w),
-            format!("║{:^38}║", crate::t!("help.title")),
-            format!("╠{}╣", box_w),
-            format!("║  {}  ║", crate::t!("help.playback_header")),
-            format!("║  Enter       {}  ║", crate::t!("help.play")),
-            format!("║  Space       {}  ║", crate::t!("help.toggle")),
-            format!("║  s           {}  ║", crate::t!("help.stop")),
-            format!("║  ← / →       {}  ║", crate::t!("help.seek")),
-            format!("║  m           {}  ║", crate::t!("help.play_mode")),
-            format!("║  + / =       {}  ║", crate::t!("help.volume")),
-            format!("║  - / _        {}  ║", ""),
-            format!("║  {}  ║", crate::t!("help.nav_header")),
-            format!("║  ↑ / ↓       {}  ║", crate::t!("help.nav_up_down")),
-            format!("║  PgUp/PgDn   {}  ║", crate::t!("help.nav_page")),
-            format!("║  g           {}  ║", crate::t!("help.goto_playing")),
-            format!("║  /           {}  ║", crate::t!("help.search")),
-            format!("║  {}  ║", crate::t!("help.queue_header")),
-            format!("║  x           {}  ║", crate::t!("help.queue_play_next")),
-            format!("║  w           {}  ║", crate::t!("help.queue_add")),
-            format!("║  u           {}  ║", crate::t!("help.queue_view")),
-            format!("║  {}  ║", crate::t!("help.playlist_header")),
-            format!("║  a           {}  ║", crate::t!("help.playlist_add")),
-            format!("║  l           {}  ║", crate::t!("help.playlist_manage")),
-            format!("║  c           {}  ║", crate::t!("help.playlist_create")),
-            format!("║  d           {}  ║", crate::t!("help.playlist_delete")),
-            format!("║  {}  ║", crate::t!("help.system_header")),
-            format!("║  r           {}  ║", crate::t!("help.refresh")),
-            format!("║  R           {}  ║", crate::t!("help.config")),
-            format!("║  L           {}  ║", crate::t!("help.language")),
-            format!("║  h / ?       {}  ║", crate::t!("help.help")),
-            format!("║  q / Esc     {}  ║", crate::t!("help.quit")),
-            format!("╚{}╝", box_w),
-        ]
+        &*HELP_ZH
     };
 
     let lines: Vec<Line> = help_text
@@ -688,7 +713,7 @@ fn render_config_edit(frame: &mut Frame, area: Rect, app: &App) {
     let fields: &[(&str, usize)] = &[
         (crate::t!("config.label_name"), 0),
         (crate::t!("config.label_type"), 1),
-        ("URL", 2),
+        (crate::t!("config.label_url"), 2),
         (crate::t!("config.label_user"), 3),
         (crate::t!("config.label_password"), 4),
     ];

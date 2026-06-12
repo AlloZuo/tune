@@ -11,6 +11,47 @@ pub mod file_transfer;
 pub mod local;
 pub mod navidrome;
 
+// ── Password obfuscation ──
+
+mod password_serde {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(pwd: &str, s: S) -> Result<S::Ok, S::Error> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(pwd);
+        s.serialize_str(&encoded)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        let s = String::deserialize(d)?;
+        // Try base64 decode; fall back to plaintext for backward compat
+        Ok(base64::engine::general_purpose::STANDARD
+            .decode(&s)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or(s))
+    }
+}
+
+// ── Common URL encoding ──
+
+/// Percent-encode a URL path component, preserving unreserved characters.
+/// Used by both file_transfer and navidrome adapters.
+pub(crate) fn encode_url_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push_str("%20"),
+            _ => {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    out
+}
+
 /// Shared HTTP client with a 15-second timeout per request.
 pub(crate) static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -31,6 +72,9 @@ pub struct MusicEntry {
     pub artist: String,
     /// Duration in milliseconds
     pub duration: u64,
+    /// Album name (populated by servers that support grouping).
+    #[serde(default)]
+    pub album: String,
     #[allow(dead_code)]
     pub size: u64,
     /// Which server this entry came from (set by ServerPool).
@@ -59,6 +103,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub username: String,
     #[serde(default)]
+    #[serde(with = "password_serde")]
     pub password: String,
     /// Whether this server is temporarily disabled (won't be polled for
     /// music lists / search, but existing songs still play).

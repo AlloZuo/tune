@@ -138,6 +138,8 @@ fn zh(key: &str) -> &str {
         "status.jumped_to_playlist" => "已跳转到: {} — {}",
         "status.resuming" => "↻ 继续播放: {}",
         "status.sort_changed" => "排序: {}",
+        "status.filter_artist" => "筛选艺术家: {}",
+        "status.filter_cleared" => "已清除艺术家筛选",
 
         // ── Play modes ──
         "playmode.sequential" => "顺序播放",
@@ -207,6 +209,7 @@ fn zh(key: &str) -> &str {
         "help.toggle" => "Space 暂停/继续",
         "help.stop" => "s 停止",
         "help.seek" => "←/→ 快退/快进 5秒",
+        "help.next_track" => "n 下一首",
         "help.play_mode" => "m 切换播放模式",
         "help.volume" => "+/- 音量增减",
         "help.queue_header" => "─ 播放队列 ─",
@@ -224,12 +227,15 @@ fn zh(key: &str) -> &str {
         "help.language" => "L 切换语言",
         "help.help" => "h / ? 本帮助",
         "help.quit" => "q / Esc 退出 / 返回",
+        "help.filter_artist" => "f 按艺术家筛选",
+        "help.clear_filter" => "F 清除筛选",
 
         // ── Sort ──
         "sort.default" => "默认排序",
         "sort.name" => "按歌名",
         "sort.artist" => "按艺术家",
         "sort.duration" => "按时长",
+        "sort.album" => "按专辑",
 
         // ── Config server list phase ──
         "config.edit_hint_name" => "名称",
@@ -240,6 +246,7 @@ fn zh(key: &str) -> &str {
         // ── Misc ──
         "misc.quick_filter" => "按服务器",
         "misc.servers_count" => "{} 个服务器",
+        "misc.filter_artist" => "艺术家筛选",
         "header.title" => " ♪ 音源播放器 [{}]{}  {}  |  {} 首  {} 歌单",
 
         _ => key,
@@ -301,6 +308,8 @@ fn en(key: &str) -> &str {
         "status.jumped_to_playlist" => "Jumped to: {} — {}",
         "status.resuming" => "↻ Resuming: {}",
         "status.sort_changed" => "Sort: {}",
+        "status.filter_artist" => "Filtering by artist: {}",
+        "status.filter_cleared" => "Artist filter cleared",
 
         // ── Play modes ──
         "playmode.sequential" => "Sequential",
@@ -370,6 +379,7 @@ fn en(key: &str) -> &str {
         "help.toggle" => "Space Pause / Resume",
         "help.stop" => "s Stop",
         "help.seek" => "←/→ Seek 5s",
+        "help.next_track" => "n Next track",
         "help.play_mode" => "m Cycle play mode",
         "help.volume" => "+/- Volume",
         "help.queue_header" => "─ Play Queue ─",
@@ -387,12 +397,15 @@ fn en(key: &str) -> &str {
         "help.language" => "L Switch language",
         "help.help" => "h / ? Help",
         "help.quit" => "q / Esc Quit / back",
+        "help.filter_artist" => "f Filter by artist",
+        "help.clear_filter" => "F Clear filter",
 
         // ── Sort ──
         "sort.default" => "Default",
         "sort.name" => "By name",
         "sort.artist" => "By artist",
         "sort.duration" => "By duration",
+        "sort.album" => "By album",
 
         // ── Config server list phase ──
         "config.edit_hint_name" => "Name",
@@ -403,6 +416,7 @@ fn en(key: &str) -> &str {
         // ── Misc ──
         "misc.quick_filter" => "by server",
         "misc.servers_count" => "{} servers",
+        "misc.filter_artist" => "Artist filter",
         "header.title" => " ♪ Tune Player [{}]{}  {}  |  {} songs  {} playlists",
 
         _ => key,

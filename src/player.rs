@@ -408,19 +408,17 @@ impl Player {
     /// The decoder blocks on `read()` when no data is available, which is
     /// safe because rodio drives the decoder on its own thread.
     pub fn play_streaming(&mut self, buf: Arc<SharedAudioBuf>, track: TrackInfo) -> Result<()> {
-        // Wait for at least 256 KB of initial data so the decoder can
-        // parse headers and start playing.  This blocks the current thread
-        // (the main event loop), so the download task must already be
-        // running by the time we get here.
+        // StreamReady is only sent after 256 KB has been buffered,
+        // so the data should already be available. Use a non-blocking
+        // check instead of wait_while to avoid freezing the main loop.
         const MIN_BYTES: usize = 256 * 1024;
         {
             let guard = buf.inner.lock().unwrap();
-            let guard = buf
-                .data_ready
-                .wait_while(guard, |state| state.data.len() < MIN_BYTES && !state.eof)
-                .map_err(|_| anyhow::anyhow!("等待下载数据时出错"))?;
+            if guard.data.len() < MIN_BYTES && !guard.eof {
+                anyhow::bail!("Not enough data buffered for streaming (have {} bytes, need {})", guard.data.len(), MIN_BYTES);
+            }
             if guard.data.is_empty() {
-                anyhow::bail!("没有收到音频数据，下载可能失败");
+                anyhow::bail!("No audio data received, download may have failed");
             }
         }
 
@@ -486,7 +484,7 @@ impl Player {
                 guard = buf
                     .data_ready
                     .wait_while(guard, |state| !state.eof)
-                    .map_err(|_| anyhow::anyhow!("等待下载完成时出错"))?;
+                    .map_err(|_| anyhow::anyhow!("Timed out waiting for streaming download to complete"))?;
             }
             let full = guard.data.clone();
             drop(guard);
@@ -496,7 +494,7 @@ impl Player {
         } else {
             self.audio_data
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("没有可 seek 的音频数据"))?
+                .ok_or_else(|| anyhow::anyhow!("No audio data available for seeking"))?
         };
 
         let total = self
@@ -521,7 +519,7 @@ impl Player {
                 let source2 = Decoder::new(cursor2)?;
                 Box::new(source2.skip_duration(seek_dur))
             }
-            Err(_) => anyhow::bail!("seek 失败"),
+            Err(_) => anyhow::bail!("seek failed"),
         };
 
         if let Some(sink) = &self.sink {
@@ -546,7 +544,7 @@ impl Player {
                 guard = buf
                     .data_ready
                     .wait_while(guard, |state| !state.eof)
-                    .map_err(|_| anyhow::anyhow!("等待下载完成时出错"))?;
+                    .map_err(|_| anyhow::anyhow!("Timed out waiting for streaming download to complete"))?;
             }
             let full = guard.data.clone();
             drop(guard);
@@ -556,7 +554,7 @@ impl Player {
         } else {
             self.audio_data
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("没有可 seek 的音频数据"))?
+                .ok_or_else(|| anyhow::anyhow!("No audio data available for seeking"))?
         };
 
         let total = self
@@ -583,12 +581,12 @@ impl Player {
                                     let source2 = Decoder::new(cursor2)?;
                                     Box::new(source2.skip_duration(seek_dur))
                                 }
-                                Err(_) => anyhow::bail!("seek 失败"),
+                                Err(_) => anyhow::bail!("seek failed"),
                             };
                         Ok::<_, anyhow::Error>(seeked)
                     })
                     .await
-                    .map_err(|e| anyhow::anyhow!("seek 任务异常: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("seek task panicked: {}", e))?;
                 result?
             };
 
@@ -793,12 +791,12 @@ pub async fn decode_seek_source(
                     let source2 = Decoder::new(cursor2)?;
                     Box::new(source2.skip_duration(seek_dur))
                 }
-                Err(_) => anyhow::bail!("seek 失败"),
+                Err(_) => anyhow::bail!("seek failed"),
             };
             Ok::<_, anyhow::Error>(seeked)
         })
         .await
-        .map_err(|e| anyhow::anyhow!("seek 任务异常: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("seek task panicked: {}", e))?;
 
     result
 }
@@ -814,6 +812,7 @@ mod tests {
             absolute_path: format!("/music/{}.mp3", name),
             name: name.to_string(),
             artist: "test".to_string(),
+            album: String::new(),
             duration: 200_000,
             size: 1000,
             server_id: "test-server".to_string(),

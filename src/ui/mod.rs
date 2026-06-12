@@ -79,6 +79,12 @@ pub enum AppEvent {
     ToggleQueue,
     ToggleLanguage,
     CycleSort,
+    /// Skip to next track (manual auto-next).
+    NextTrack,
+    /// Filter current list by selected song's artist.
+    FilterByArtist,
+    /// Clear the active artist filter.
+    ClearArtistFilter,
 }
 
 // ── Sort mode ──
@@ -89,6 +95,7 @@ pub enum SortMode {
     Name,
     Artist,
     Duration,
+    Album,
 }
 
 impl SortMode {
@@ -97,7 +104,8 @@ impl SortMode {
             SortMode::Default => SortMode::Name,
             SortMode::Name => SortMode::Artist,
             SortMode::Artist => SortMode::Duration,
-            SortMode::Duration => SortMode::Default,
+            SortMode::Duration => SortMode::Album,
+            SortMode::Album => SortMode::Default,
         }
     }
 
@@ -107,8 +115,21 @@ impl SortMode {
             SortMode::Name => crate::tf!("sort.name"),
             SortMode::Artist => crate::tf!("sort.artist"),
             SortMode::Duration => crate::tf!("sort.duration"),
+            SortMode::Album => crate::tf!("sort.album"),
         }
     }
+}
+
+// ── Display items for grouped rendering ──
+
+/// An item in the visual display list for Browse mode.
+/// When Album sort is active, headers are inserted between groups of songs.
+#[derive(Debug, Clone)]
+pub enum DisplayItem {
+    /// A selectable song, storing its index in `filtered_music`.
+    Song(usize),
+    /// A non-selectable album header.
+    AlbumHeader { album: String, artist: String, song_count: usize },
 }
 
 // ──────────────────────────────────────────────
@@ -165,6 +186,11 @@ pub struct App {
 
     // ── Sort ──
     pub sort_mode: SortMode,
+
+    // ── Album grouping ──
+    pub artist_filter: Option<String>,
+    /// Display items for Browse view (may include album headers).
+    pub display_items: Vec<DisplayItem>,
 }
 
 impl App {
@@ -208,6 +234,8 @@ impl App {
             confirm_quit: false,
             resume_position_ms: None,
             sort_mode: SortMode::Default,
+            artist_filter: None,
+            display_items: Vec::new(),
         }
     }
 
@@ -220,27 +248,37 @@ impl App {
     }
 
     pub fn apply_filter(&mut self) {
-        if self.search_query.is_empty() {
-            self.filtered_music = self.all_music.clone();
+        let iter: Box<dyn Iterator<Item = &MusicEntry>> = if self.search_query.is_empty() {
+            Box::new(self.all_music.iter())
         } else {
             let q = self.search_query.to_lowercase();
-            self.filtered_music = self
-                .all_music
-                .iter()
-                .filter(|m| {
-                    m.name.to_lowercase().contains(&q)
-                        || m.artist.to_lowercase().contains(&q)
-                })
+            Box::new(
+                self.all_music
+                    .iter()
+                    .filter(move |m| {
+                        m.name.to_lowercase().contains(&q)
+                            || m.artist.to_lowercase().contains(&q)
+                    }),
+            )
+        };
+
+        self.filtered_music = if let Some(ref artist) = self.artist_filter {
+            let artist_lower = artist.to_lowercase();
+            iter.filter(|m| m.artist.to_lowercase() == artist_lower)
                 .cloned()
-                .collect();
-        }
+                .collect()
+        } else {
+            iter.cloned().collect()
+        };
+
         self.apply_sort();
+        self.rebuild_display();
         if self.filtered_music.is_empty() {
             self.list_state.select(None);
         } else {
             let idx = self.list_state.selected().unwrap_or(0);
             self.list_state
-                .select(Some(idx.min(self.filtered_music.len() - 1)));
+                .select(Some(idx.min(self.display_items.len().saturating_sub(1))));
         }
     }
 
@@ -258,13 +296,83 @@ impl App {
             SortMode::Duration => {
                 self.filtered_music.sort_by_key(|m| m.duration);
             }
+            SortMode::Album => {
+                self.filtered_music.sort_by(|a, b| {
+                    a.album
+                        .to_lowercase()
+                        .cmp(&b.album.to_lowercase())
+                        .then_with(|| a.artist.to_lowercase().cmp(&b.artist.to_lowercase()))
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
+            }
         }
     }
 
     /// Currently selected music entry (in browse view).
+    /// Maps the display list index through DisplayItem to find the actual song.
     pub fn selected_music(&self) -> Option<&MusicEntry> {
-        let idx = self.list_state.selected()?;
-        self.filtered_music.get(idx)
+        let di = self.list_state.selected()?;
+        match self.display_items.get(di)? {
+            DisplayItem::Song(data_idx) => self.filtered_music.get(*data_idx),
+            DisplayItem::AlbumHeader { .. } => None,
+        }
+    }
+
+    /// Selected display index in browse view (0-based within display_items).
+    /// Returns None if the selected item is an album header (unselectable).
+    pub fn selected_display_song_index(&self) -> Option<usize> {
+        let di = self.list_state.selected()?;
+        match self.display_items.get(di)? {
+            DisplayItem::Song(data_idx) => Some(*data_idx),
+            DisplayItem::AlbumHeader { .. } => None,
+        }
+    }
+
+    /// Rebuild `display_items` from `filtered_music` and `sort_mode`.
+    /// In Album mode, album headers are inserted between groups.
+    pub fn rebuild_display(&mut self) {
+        if self.sort_mode == SortMode::Album {
+            self.display_items = build_album_display(&self.filtered_music);
+        } else {
+            self.display_items = (0..self.filtered_music.len())
+                .map(DisplayItem::Song)
+                .collect();
+        }
+        self.clamp_selection_to_song();
+    }
+
+    fn clamp_selection_to_song(&mut self) {
+        let Some(di) = self.list_state.selected() else {
+            // If nothing selected and there are songs, select first song
+            if !self.display_items.is_empty() && self.filtered_music.is_empty() {
+                return;
+            }
+            return;
+        };
+        if self.display_items.is_empty() {
+            self.list_state.select(None);
+            return;
+        }
+        let max = self.display_items.len().saturating_sub(1);
+        let clamped = di.min(max);
+        let new_di = if matches!(self.display_items.get(clamped), Some(DisplayItem::AlbumHeader { .. })) {
+            // Try forward first, then backward
+            (clamped + 1..=max)
+                .chain((0..clamped).rev())
+                .find(|&i| matches!(self.display_items.get(i), Some(DisplayItem::Song(_))))
+                .unwrap_or(clamped)
+        } else {
+            clamped
+        };
+        self.list_state.select(Some(new_di));
+    }
+
+    /// Find the display item index for a given filtered_music index.
+    pub fn find_display_index_for_song(&self, data_idx: usize) -> Option<usize> {
+        self.display_items.iter().position(|item| match item {
+            DisplayItem::Song(idx) => *idx == data_idx,
+            DisplayItem::AlbumHeader { .. } => false,
+        })
     }
 
     // ── Playlist helpers ──
@@ -339,8 +447,17 @@ impl App {
         match self.view_mode {
             ViewMode::Browse => {
                 let i = self.list_state.selected().unwrap_or(0);
-                if i > 0 {
-                    self.list_state.select(Some(i - 1));
+                let mut new_idx = i.saturating_sub(1);
+                // Skip album headers
+                while new_idx > 0
+                    && matches!(self.display_items.get(new_idx), Some(DisplayItem::AlbumHeader { .. }))
+                {
+                    new_idx = new_idx.saturating_sub(1);
+                }
+                if new_idx > 0
+                    || matches!(self.display_items.get(new_idx), Some(DisplayItem::Song(_)))
+                {
+                    self.list_state.select(Some(new_idx));
                 }
             }
             ViewMode::PlaylistList => {
@@ -365,8 +482,16 @@ impl App {
                     return;
                 }
                 let i = self.list_state.selected().unwrap_or(0);
-                if i + 1 < self.filtered_music.len() {
-                    self.list_state.select(Some(i + 1));
+                let mut new_idx = i + 1;
+                let max = self.display_items.len().saturating_sub(1);
+                // Skip album headers
+                while new_idx < max
+                    && matches!(self.display_items.get(new_idx), Some(DisplayItem::AlbumHeader { .. }))
+                {
+                    new_idx += 1;
+                }
+                if matches!(self.display_items.get(new_idx), Some(DisplayItem::Song(_))) {
+                    self.list_state.select(Some(new_idx));
                 }
             }
             ViewMode::PlaylistList => {
@@ -394,6 +519,7 @@ impl App {
             ViewMode::Browse => {
                 let i = self.list_state.selected().unwrap_or(0);
                 self.list_state.select(Some(i.saturating_sub(page)));
+                self.clamp_selection_to_song();
             }
             ViewMode::PlaylistList => {
                 let i = self.pl_list_state.selected().unwrap_or(0);
@@ -414,8 +540,9 @@ impl App {
                     return;
                 }
                 let i = self.list_state.selected().unwrap_or(0);
-                let new = (i + page).min(self.filtered_music.len() - 1);
+                let new = (i + page).min(self.display_items.len().saturating_sub(1));
                 self.list_state.select(Some(new));
+                self.clamp_selection_to_song();
             }
             ViewMode::PlaylistList => {
                 if self.playlists.is_empty() {
@@ -478,4 +605,38 @@ impl App {
             ViewMode::PlaylistList => None,
         }
     }
+}
+
+// ── Album grouping helpers ──
+
+/// Build a display list from filtered_music when SortMode::Album is active.
+/// Groups consecutive songs by album name and inserts album headers.
+fn build_album_display(songs: &[MusicEntry]) -> Vec<DisplayItem> {
+    let mut items = Vec::new();
+    let mut i = 0;
+    while i < songs.len() {
+        let album = songs[i].album.clone();
+        // Group consecutive songs with the same non-empty album
+        if album.is_empty() {
+            // No album info: just add songs without header
+            items.push(DisplayItem::Song(i));
+            i += 1;
+        } else {
+            let start = i;
+            let artist = songs[i].artist.clone();
+            i += 1;
+            while i < songs.len() && songs[i].album == album {
+                i += 1;
+            }
+            items.push(DisplayItem::AlbumHeader {
+                album,
+                artist,
+                song_count: i - start,
+            });
+            for j in start..i {
+                items.push(DisplayItem::Song(j));
+            }
+        }
+    }
+    items
 }

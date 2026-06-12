@@ -115,6 +115,7 @@ impl MusicServer for LocalServer {
                         absolute_path,
                         name: file_stem,
                         artist,
+                        album: String::new(),
                         duration,
                         size: 0,
                         server_id: String::new(),

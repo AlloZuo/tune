@@ -342,6 +342,12 @@ impl App {
             KeyCode::Char('R') => Some(AppEvent::ConfigureServer),
             KeyCode::Char('g') => Some(AppEvent::GoToPlaying),
             KeyCode::Char('S') => Some(AppEvent::CycleSort),
+            KeyCode::Char('f') if self.view_mode == ViewMode::Browse => {
+                Some(AppEvent::FilterByArtist)
+            }
+            KeyCode::Char('F') if self.view_mode == ViewMode::Browse => {
+                Some(AppEvent::ClearArtistFilter)
+            }
 
             // Playlists
             KeyCode::Char('l') => {
@@ -418,6 +424,9 @@ impl App {
                     Some(AppEvent::ToggleQueue)
                 }
             }
+
+            // Next track
+            KeyCode::Char('n') => Some(AppEvent::NextTrack),
 
             KeyCode::Char('h' | '?') => Some(AppEvent::ShowHelp),
             KeyCode::Char('L') => Some(AppEvent::ToggleLanguage),
