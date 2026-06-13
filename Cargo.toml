@@ -3,6 +3,13 @@ name = "tune"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+# Optimize for binary size — ~11 MB → ~5-6 MB
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
