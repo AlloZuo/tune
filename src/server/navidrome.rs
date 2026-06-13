@@ -1,23 +1,29 @@
-/// Navidrome (Subsonic API) adapter.
-///
-/// Subsonic API is a de-facto standard used by Navidrome, Airsonic,
-/// Gonic, Ampache, and many other self-hosted music servers.
-///
-/// API Docs: http://www.subsonic.org/pages/api.jsp
-///
-/// Endpoints used:
-/// - `GET /rest/getAlbumList2` — browse albums
-/// - `GET /rest/getAlbum` — get songs in an album
-/// - `GET /rest/stream` — stream audio by song ID
-/// - `GET /rest/search3` — search songs
-/// - `GET /rest/getCoverArt` — album art URL
+//! Navidrome (Subsonic API) adapter.
+//!
+//! Subsonic API is a de-facto standard used by Navidrome, Airsonic,
+//! Gonic, Ampache, and many other self-hosted music servers.
+//!
+//! API Docs: http://www.subsonic.org/pages/api.jsp
+//!
+//! Endpoints used:
+//! - `GET /rest/getAlbumList2` — browse albums
+//! - `GET /rest/getAlbum` — get songs in an album
+//! - `GET /rest/stream` — stream audio by song ID
+//! - `GET /rest/search3` — search songs
+//! - `GET /rest/getCoverArt` — album art URL
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 
 use crate::server::{HTTP, MusicEntry, MusicServer, ServerFeatures};
 use crate::lyrics::Lyrics;
+
+/// Max concurrent album detail requests to Navidrome (gentle on the server).
+const ALBUM_CONCURRENCY: usize = 10;
 
 // ── Server struct ──
 
@@ -60,45 +66,41 @@ impl SubsonicServer {
         }
     }
 
-    /// Fetch songs belonging to an album.
-    async fn fetch_album_songs(&self, album_id: &str) -> Result<Vec<MusicEntry>> {
-        let url = format!(
-            "{}/rest/getAlbum?id={}&{}",
-            self.base_url,
-            album_id,
-            self.auth_params()
-        );
-        let response = HTTP.get(&url).send().await?;
-        Self::check_status(response.status(), "getAlbum")?;
-        let text = response.text().await?;
-        let resp: SubsonicAlbumResponse = serde_json::from_str(&text).map_err(|e| {
-            let preview = &text[..text.len().min(200)];
-            anyhow::anyhow!(
-                "getAlbum({}) JSON 格式错误: {} | 预览: {}",
-                album_id, e, preview
-            )
-        })?;
-        let album = resp
-            .inner
-            .album
-            .ok_or_else(|| anyhow::anyhow!("album not found: {}", album_id))?;
+}
 
-        Ok(album
-            .song
-            .into_iter()
-            .map(|s| MusicEntry {
-                id: 0,
-                absolute_path: s.id,
-                name: s.title,
-                artist: s.artist.clone().unwrap_or_else(|| album.artist.clone()),
-                album: album.name.clone(),
-                // Subsonic API returns duration in seconds; convert to ms
-                duration: s.duration * 1000,
-                size: 0,
-                server_id: String::new(),
-            })
-            .collect())
-    }
+/// Standalone implementation so it can be called concurrently from `fetch_list`.
+async fn fetch_album_songs_impl(base_url: &str, auth: &str, album_id: &str) -> Result<Vec<MusicEntry>> {
+    let url = format!(
+        "{}/rest/getAlbum?id={}&{}",
+        base_url, album_id, auth
+    );
+    let response = HTTP.get(&url).send().await?;
+    SubsonicServer::check_status(response.status(), "getAlbum")?;
+    let text = response.text().await?;
+    let resp: SubsonicAlbumResponse = serde_json::from_str(&text).map_err(|e| {
+        let preview = &text[..text.len().min(200)];
+        anyhow::anyhow!(
+            "getAlbum({}) JSON error: {} | preview: {}",
+            album_id, e, preview
+        )
+    })?;
+    let album = resp
+        .inner
+        .album
+        .ok_or_else(|| anyhow::anyhow!("album not found: {}", album_id))?;
+
+    Ok(album
+        .song
+        .into_iter()
+        .map(|s| MusicEntry {
+            absolute_path: s.id,
+            name: s.title,
+            artist: s.artist.clone().unwrap_or_else(|| album.artist.clone()),
+            album: album.name.clone(),
+            duration: s.duration * 1000,
+            server_id: String::new(),
+        })
+        .collect())
 }
 
 // ── Subsonic API response types ──
@@ -148,9 +150,6 @@ struct SubsonicAlbumInner {
 
 #[derive(Debug, Deserialize)]
 struct SubsonicAlbumDetail {
-    #[allow(dead_code)]
-    id: String,
-    #[allow(dead_code)]
     name: String,
     artist: String,
     song: Vec<SubsonicSong>,
@@ -247,13 +246,33 @@ impl MusicServer for SubsonicServer {
         })?;
         let albums = resp.inner.album_list.map(|l| l.album).unwrap_or_default();
 
-        // 2. Fetch songs for each album (sequential to be gentle on the server)
-        let mut all_songs = Vec::new();
+        // 2. Fetch songs for each album concurrently (limited by ALBUM_CONCURRENCY).
+        let base_url = self.base_url.clone();
+        let auth = self.auth_params();
+        let sem = Arc::new(Semaphore::new(ALBUM_CONCURRENCY));
+        let mut handles = Vec::with_capacity(albums.len());
         for album in &albums {
-            match self.fetch_album_songs(&album.id).await {
-                Ok(songs) => all_songs.extend(songs),
+            let sem = sem.clone();
+            let base = base_url.clone();
+            let auth = auth.clone();
+            let album_id = album.id.clone();
+            let album_name = album.name.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
+                let songs = fetch_album_songs_impl(&base, &auth, &album_id).await;
+                (album_name, songs)
+            }));
+        }
+
+        let mut all_songs = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok((_name, Ok(songs))) => all_songs.extend(songs),
+                Ok((name, Err(e))) => {
+                    crate::log_error!("获取专辑「{}」歌曲失败: {}", name, e);
+                }
                 Err(e) => {
-                    crate::log_error!("获取专辑「{}」歌曲失败: {}", album.name, e);
+                    crate::log_error!("获取专辑任务失败: {}", e);
                 }
             }
         }
@@ -303,14 +322,12 @@ impl MusicServer for SubsonicServer {
         Ok(songs
             .into_iter()
             .map(|s| MusicEntry {
-                id: 0,
                 absolute_path: s.id,
                 name: s.title,
                 artist: s.artist.unwrap_or_default(),
                 album: s.album.unwrap_or_default(),
                 // Subsonic API returns duration in seconds; convert to ms
                 duration: s.duration * 1000,
-                size: 0,
                 server_id: String::new(),
             })
             .collect())
