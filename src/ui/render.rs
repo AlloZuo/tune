@@ -11,7 +11,7 @@ use ratatui::{
 use crate::player::PlayerState;
 use crate::server::MusicEntry;
 
-use super::{App, DisplayItem, PlayingSource, SortMode, ViewMode};
+use super::{App, CoverArt, DisplayItem, PlayingSource, SortMode, ViewMode};
 
 // ──────────────────────────────────────────────
 // Rendering entry point
@@ -52,6 +52,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.config_mode {
         render_config_overlay(frame, area, app);
+    }
+    if app.show_cover {
+        render_cover_overlay(frame, area, app);
     }
     if app.show_help {
         render_help_overlay(frame, area, app);
@@ -555,43 +558,155 @@ fn render_create_playlist_overlay(frame: &mut Frame, area: Rect, _app: &App) {
 }
 
 fn build_help_lines() -> Vec<String> {
-    let box_w = "══════════════════════════════════════";
     vec![
-        format!("╔{}╗", box_w),
-        format!("║{:^38}║", crate::t!("help.title")),
-        format!("╠{}╣", box_w),
-        format!("║  {}  ║", crate::t!("help.playback_header")),
-        format!("║  Enter       {}  ║", crate::t!("help.play")),
-        format!("║  Space       {}  ║", crate::t!("help.toggle")),
-        format!("║  s           {}  ║", crate::t!("help.stop")),
-        format!("║  ← / →       {}  ║", crate::t!("help.seek")),
-        format!("║  n           {}  ║", crate::t!("help.next_track")),
-        format!("║  m           {}  ║", crate::t!("help.play_mode")),
-        format!("║  + / =       {}  ║", crate::t!("help.volume")),
-        format!("║  - / _        {}  ║", ""),
-        format!("║  {}  ║", crate::t!("help.nav_header")),
-        format!("║  ↑ / ↓       {}  ║", crate::t!("help.nav_up_down")),
-        format!("║  PgUp/PgDn   {}  ║", crate::t!("help.nav_page")),
-        format!("║  g           {}  ║", crate::t!("help.goto_playing")),
-        format!("║  /           {}  ║", crate::t!("help.search")),
-        format!("║  f / F       {}  ║", crate::t!("help.filter_artist")),
-        format!("║  {}  ║", crate::t!("help.queue_header")),
-        format!("║  x           {}  ║", crate::t!("help.queue_play_next")),
-        format!("║  w           {}  ║", crate::t!("help.queue_add")),
-        format!("║  u           {}  ║", crate::t!("help.queue_view")),
-        format!("║  {}  ║", crate::t!("help.playlist_header")),
-        format!("║  a           {}  ║", crate::t!("help.playlist_add")),
-        format!("║  l           {}  ║", crate::t!("help.playlist_manage")),
-        format!("║  c           {}  ║", crate::t!("help.playlist_create")),
-        format!("║  d           {}  ║", crate::t!("help.playlist_delete")),
-        format!("║  {}  ║", crate::t!("help.system_header")),
-        format!("║  r           {}  ║", crate::t!("help.refresh")),
-        format!("║  R           {}  ║", crate::t!("help.config")),
-        format!("║  L           {}  ║", crate::t!("help.language")),
-        format!("║  h / ?       {}  ║", crate::t!("help.help")),
-        format!("║  q / Esc     {}  ║", crate::t!("help.quit")),
-        format!("╚{}╝", box_w),
+        format!("  {}  ", crate::t!("help.playback_header")),
+        format!("  Enter       {}  ", crate::t!("help.play")),
+        format!("  Space       {}  ", crate::t!("help.toggle")),
+        format!("  s           {}  ", crate::t!("help.stop")),
+        format!("  ← / →       {}  ", crate::t!("help.seek")),
+        format!("  n           {}  ", crate::t!("help.next_track")),
+        format!("  m           {}  ", crate::t!("help.play_mode")),
+        format!("  + / =       {}  ", crate::t!("help.volume")),
+        format!("  - / _        {}  ", ""),
+        format!("  {}  ", crate::t!("help.nav_header")),
+        format!("  ↑ / ↓       {}  ", crate::t!("help.nav_up_down")),
+        format!("  PgUp/PgDn   {}  ", crate::t!("help.nav_page")),
+        format!("  g           {}  ", crate::t!("help.goto_playing")),
+        format!("  /           {}  ", crate::t!("help.search")),
+        format!("  f / F       {}  ", crate::t!("help.filter_artist")),
+        format!("  {}  ", crate::t!("help.queue_header")),
+        format!("  x           {}  ", crate::t!("help.queue_play_next")),
+        format!("  w           {}  ", crate::t!("help.queue_add")),
+        format!("  u           {}  ", crate::t!("help.queue_view")),
+        format!("  {}  ", crate::t!("help.playlist_header")),
+        format!("  a           {}  ", crate::t!("help.playlist_add")),
+        format!("  l           {}  ", crate::t!("help.playlist_manage")),
+        format!("  c           {}  ", crate::t!("help.playlist_create")),
+        format!("  d           {}  ", crate::t!("help.playlist_delete")),
+        format!("  {}  ", crate::t!("help.system_header")),
+        format!("  r           {}  ", crate::t!("help.refresh")),
+        format!("  R           {}  ", crate::t!("help.config")),
+        format!("  C           {}  ", crate::t!("help.cover")),
+        format!("  L           {}  ", crate::t!("help.language")),
+        format!("  h / ?       {}  ", crate::t!("help.help")),
+        format!("  q / Esc     {}  ", crate::t!("help.quit")),
     ]
+}
+
+fn render_cover_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    match &app.cover_art {
+        Some(cover) => render_cover_image(frame, area, cover, &app.cover_status),
+        None => render_cover_status(frame, area, &app.cover_status),
+    }
+}
+
+/// Render a status message when cover is loading or unavailable.
+fn render_cover_status(frame: &mut Frame, area: Rect, status: &str) {
+    let overlay_area = centered_rect(40, 20, area);
+    frame.render_widget(Clear, overlay_area);
+
+    let block = Block::default()
+        .title(format!(" {} ", crate::t!("help.title")))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::new().fg(Color::Cyan))
+        .style(Style::new().bg(Color::Black));
+
+    let text = Paragraph::new(Text::from(Line::from(Span::styled(
+        status,
+        Style::new().fg(Color::White),
+    ))))
+    .block(block)
+    .alignment(Alignment::Center);
+
+    frame.render_widget(text, overlay_area);
+}
+
+/// Center a Rect of exact width × height within `area`.
+fn centered_rect_exact(w: u16, h: u16, area: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((area.height.saturating_sub(h)) / 2),
+            Constraint::Length(h),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((area.width.saturating_sub(w)) / 2),
+            Constraint::Length(w),
+        ])
+        .split(vert[1])[1]
+}
+
+/// Render the cover image using half-block characters (▀).
+///
+/// Each terminal cell displays two vertical pixels: the top pixel is the
+/// foreground color, the bottom pixel is the background color — achieved by
+/// rendering the ▀ (upper-half block) character with the appropriate colors.
+fn render_cover_image(frame: &mut Frame, area: Rect, cover: &CoverArt, status: &str) {
+    const MAX_COLS: usize = 30;
+
+    // Compute display size in terminal cells (each cell = 2 vertical pixels).
+    // Because each row renders 2 pixel rows, we need half as many terminal rows
+    // as pixel rows to maintain the correct aspect ratio.
+    let cw = cover.width as usize;
+    let ch = cover.height as usize;
+    let aspect = cw as f64 / ch as f64;
+    let cols = MAX_COLS.min(cw);
+    let rows = ((cols as f64) / (2.0 * aspect)).round() as usize;
+    let pixel_rows = rows * 2;
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+
+    // Nearest-neighbour downscale to [pixel_rows × cols] pixels
+    let mut downscaled = vec![[0u8; 3]; pixel_rows * cols];
+    for py in 0..pixel_rows {
+        for px in 0..cols {
+            let src_x = px * cw / cols;
+            let src_y = py * ch / pixel_rows;
+            downscaled[py * cols + px] = cover.pixels[src_y * cw + src_x];
+        }
+    }
+
+    // Overlay tightly sized to the image content + border, centered
+    let overlay_w = ((cols + 2) as u16).min(area.width);   // +2 for left/right border
+    let overlay_h = ((rows + 2) as u16).min(area.height);
+    let overlay_area = centered_rect_exact(overlay_w, overlay_h, area);
+    frame.render_widget(Clear, overlay_area);
+
+    let block = Block::default()
+        .title(format!(" {} ", status))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::new().fg(Color::Cyan))
+        .style(Style::new().bg(Color::Black));
+
+    let inner_area = block.inner(overlay_area);
+    frame.render_widget(block, overlay_area);
+
+    // Build half-block lines
+    let mut lines = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let r0 = row * 2;
+        let r1 = (row * 2 + 1).min(pixel_rows - 1);
+        let mut spans = Vec::with_capacity(cols);
+        for col in 0..cols {
+            let top = downscaled[r0 * cols + col];
+            let bot = downscaled[r1 * cols + col];
+            spans.push(Span::styled(
+                "▀",
+                Style::new()
+                    .fg(Color::Rgb(top[0], top[1], top[2]))
+                    .bg(Color::Rgb(bot[0], bot[1], bot[2])),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines)).style(Style::new().bg(Color::Black));
+    frame.render_widget(paragraph, inner_area);
 }
 
 fn render_help_overlay(frame: &mut Frame, area: Rect, _app: &App) {
@@ -604,24 +719,19 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, _app: &App) {
 
     let lines: Vec<Line> = help_text
         .iter()
-        .map(|s| {
-            let is_header = s.starts_with('╔') || s.starts_with('╚') || s.starts_with('╠');
-            let style = if is_header {
-                Style::new().fg(Color::Cyan)
-            } else {
-                Style::new().fg(Color::White)
-            };
-            Line::from(Span::styled(s.as_str(), style))
-        })
+        .map(|s| Line::from(Span::styled(s.as_str(), Style::new().fg(Color::White))))
         .collect();
 
     let paragraph = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
-                .borders(Borders::NONE)
+                .title(format!(" {} ", crate::t!("help.title")))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Double)
+                .border_style(Style::new().fg(Color::Cyan))
                 .style(Style::new().bg(Color::Black)),
         )
-        .alignment(Alignment::Center);
+        .alignment(Alignment::Left);
 
     frame.render_widget(paragraph, overlay_area);
 }

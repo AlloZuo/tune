@@ -220,6 +220,18 @@ async fn main() -> Result<()> {
                 MainMessage::SeekFailed(err) => {
                     app.error_message = Some(err);
                 }
+                MainMessage::CoverReady(result) => {
+                    match result {
+                        Ok(cover) => {
+                            app.cover_art = Some(cover);
+                            app.cover_status.clear();
+                        }
+                        Err(e) => {
+                            app.cover_art = None;
+                            app.cover_status = e;
+                        }
+                    }
+                }
             }
         }
 

@@ -6,9 +6,17 @@ use std::sync::Arc;
 
 use rodio::Source;
 
-use crate::server::MusicEntry;
 use crate::lyrics::Lyrics;
 use crate::player::{SharedAudioBuf, TrackInfo};
+use crate::server::MusicEntry;
+
+/// Decoded RGB pixel data for cover art display.
+pub struct CoverArt {
+    /// Flat array of RGB triples, row-major order.
+    pub pixels: Vec<[u8; 3]>,
+    pub width: u32,
+    pub height: u32,
+}
 
 pub enum MainMessage {
     MusicListLoaded(Vec<MusicEntry>),
@@ -23,4 +31,6 @@ pub enum MainMessage {
     SeekPrepared(Box<dyn Source<Item = f32> + Send>, u64, bool),
     /// Background seek task failed.
     SeekFailed(String),
+    /// Cover art image data decoded and ready for display.
+    CoverReady(Result<CoverArt, String>),
 }

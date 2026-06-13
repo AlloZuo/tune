@@ -11,6 +11,8 @@ use crate::server::{MusicEntry, MusicServer, ServerConfig};
 use crate::player::Player;
 use std::sync::Arc;
 
+pub use crate::message::CoverArt;
+
 // ──────────────────────────────────────────────
 // Data types
 // ──────────────────────────────────────────────
@@ -86,6 +88,8 @@ pub enum AppEvent {
     FilterByArtist,
     /// Clear the active artist filter.
     ClearArtistFilter,
+    /// Toggle cover art overlay display.
+    ToggleCover,
 }
 
 // ── Sort mode ──
@@ -168,6 +172,9 @@ pub struct App {
     pub config_focus: usize,
     pub config_edit_idx: usize,
     pub config_inputs: Vec<String>,
+    /// Confirmation guard for `R` (config overlay) — prevents accidental
+    /// trigger when the user intends `r` (refresh).
+    pub config_confirm_pending: bool,
 
     // ── UI state ──
     pub show_help: bool,
@@ -197,6 +204,11 @@ pub struct App {
     pub artist_filter: Option<String>,
     /// Display items for Browse view (may include album headers).
     pub display_items: Vec<DisplayItem>,
+
+    // ── Cover art overlay ──
+    pub show_cover: bool,
+    pub cover_art: Option<CoverArt>,
+    pub cover_status: String,
 }
 
 impl App {
@@ -232,6 +244,7 @@ impl App {
             config_focus: 0,
             config_edit_idx: 0,
             config_inputs: Vec::new(),
+            config_confirm_pending: false,
 
             show_help: false,
             playing_source: None,
@@ -243,6 +256,10 @@ impl App {
             artist_filter: None,
             display_items: Vec::new(),
             background_tasks: Vec::new(),
+
+            show_cover: false,
+            cover_art: None,
+            cover_status: String::new(),
         }
     }
 

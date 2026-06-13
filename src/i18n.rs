@@ -139,6 +139,9 @@ fn zh(key: &str) -> &str {
         "status.sort_changed" => "排序: {}",
         "status.filter_artist" => "筛选艺术家: {}",
         "status.filter_cleared" => "已清除艺术家筛选",
+        "status.confirm_config" => "再次按 R 进入服务器配置",
+        "status.cover_loading" => "加载封面...",
+        "status.cover_unavailable" => "无封面",
 
         // ── Play modes ──
         "playmode.sequential" => "顺序播放",
@@ -223,6 +226,7 @@ fn zh(key: &str) -> &str {
         "help.system_header" => "─ 系统 ─",
         "help.refresh" => "r 刷新音乐列表",
         "help.config" => "R 配置服务器地址",
+        "help.cover" => "C 显示封面",
         "help.language" => "L 切换语言",
         "help.help" => "h / ? 本帮助",
         "help.quit" => "q / Esc 退出 / 返回",
@@ -310,6 +314,9 @@ fn en(key: &str) -> &str {
         "status.sort_changed" => "Sort: {}",
         "status.filter_artist" => "Filtering by artist: {}",
         "status.filter_cleared" => "Artist filter cleared",
+        "status.confirm_config" => "Press R again to configure servers",
+        "status.cover_loading" => "Loading cover...",
+        "status.cover_unavailable" => "No cover art",
 
         // ── Play modes ──
         "playmode.sequential" => "Sequential",
@@ -394,6 +401,7 @@ fn en(key: &str) -> &str {
         "help.system_header" => "─ System ─",
         "help.refresh" => "r Refresh music list",
         "help.config" => "R Configure servers",
+        "help.cover" => "C Show cover art",
         "help.language" => "L Switch language",
         "help.help" => "h / ? Help",
         "help.quit" => "q / Esc Quit / back",

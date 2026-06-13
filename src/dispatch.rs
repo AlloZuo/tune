@@ -16,6 +16,10 @@ use tokio::sync::mpsc;
 /// Returns `true` if the action may have started a background download
 /// (so the caller should yield to let tokio poll it).
 pub(crate) fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Sender<MainMessage>) -> bool {
+    // Clear config confirmation guard on any action other than a second R press.
+    if action != AppEvent::ConfigureServer {
+        app.config_confirm_pending = false;
+    }
     match action {
         // ── Playback ──
         AppEvent::PlaySelected => {
@@ -250,6 +254,12 @@ pub(crate) fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Send
             }
         }
         AppEvent::ConfigureServer => {
+            if !app.config_confirm_pending {
+                app.config_confirm_pending = true;
+                app.status_message = crate::tf!("status.confirm_config");
+                return false;
+            }
+            app.config_confirm_pending = false;
             app.config_mode = true;
             app.config_phase = 0; // list
             app.config_focus = 0;
@@ -359,6 +369,46 @@ pub(crate) fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Send
             }
             false
         }
+        AppEvent::ToggleCover => {
+            if app.show_cover {
+                app.show_cover = false;
+                return false;
+            }
+
+            let music = match app.selected_in_current_view() {
+                Some((m, _)) => m,
+                None => return false,
+            };
+            let server_id = music.server_id.clone();
+
+            app.cover_status = crate::tf!("status.cover_loading");
+            app.show_cover = true;
+            app.cover_art = None;
+
+            let tx = tx.clone();
+            // Share the server pool via Arc so the background task can call fetch_cover_data
+            let server = app.server.clone();
+            let handle = tokio::spawn(async move {
+                // The server trait method handles all backends:
+                //   Navidrome → HTTP download from cover_url()
+                //   Local/FileTransfer → extract embedded cover via lofty
+                let cover_data = server.fetch_cover_data(&MusicEntry {
+                    server_id,
+                    ..music
+                }).await;
+                match cover_data {
+                    Some(bytes) => {
+                        let cover = decode_cover_bytes(&bytes).await;
+                        let _ = tx.send(MainMessage::CoverReady(cover)).await;
+                    }
+                    None => {
+                        let _ = tx.send(MainMessage::CoverReady(Err(crate::tf!("status.cover_unavailable").to_string()))).await;
+                    }
+                }
+            });
+            app.track_background_task(handle.abort_handle());
+            true
+        }
         AppEvent::ToggleLanguage => {
             let new = crate::i18n::current().toggle();
             crate::i18n::init(new.as_str());
@@ -405,4 +455,16 @@ pub(crate) fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Send
         }
         AppEvent::None => false,
     }
+}
+
+// ── Cover art decoding ──
+
+/// Decode raw JPEG/PNG bytes to RGB pixel data for cover rendering.
+async fn decode_cover_bytes(bytes: &[u8]) -> Result<CoverArt, String> {
+    let img =
+        image::load_from_memory(bytes).map_err(|e| format!("cover decode failed: {}", e))?;
+    let rgb = img.to_rgb8();
+    let (width, height) = rgb.dimensions();
+    let pixels = rgb.into_raw().chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    Ok(CoverArt { pixels, width, height })
 }
