@@ -70,15 +70,13 @@ impl AudioCache {
             Err(_) => return,
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Ok(meta) = entry.metadata().await {
-                if let Ok(modified) = meta.modified() {
-                    if now.duration_since(modified).map_or(false, |age| {
+            if let Ok(meta) = entry.metadata().await
+                && let Ok(modified) = meta.modified()
+                    && now.duration_since(modified).is_ok_and(|age| {
                         age.as_secs() > CACHE_MAX_AGE_SECS
                     }) {
                         let _ = tokio::fs::remove_file(entry.path()).await;
                     }
-                }
-            }
         }
     }
 

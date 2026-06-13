@@ -20,7 +20,7 @@ pub enum MainMessage {
     LyricsReady(Option<Lyrics>),
     /// A background seek task has finished decoding.
     /// (`source`, `pos_ms`, `is_forward` — for status message direction).
-    SeekPrepared(Box<dyn Source<Item = i16> + Send>, u64, bool),
+    SeekPrepared(Box<dyn Source<Item = f32> + Send>, u64, bool),
     /// Background seek task failed.
     SeekFailed(String),
 }

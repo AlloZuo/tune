@@ -1,16 +1,16 @@
-/// Simple file-based error logger.
-///
-/// Initialized once at startup; writes timestamped ERROR lines
-/// to a log file (defaults to `tune.log` in the working directory).
-///
-/// Opens and closes the file on every write so the log is visible
-/// immediately without needing to close the app.
-///
-/// # Usage
-/// ```ignore
-/// log::init("tune.log");
-/// log_error!("something went wrong: {}", err);
-/// ```
+//! Simple file-based error logger.
+//!
+//! Initialized once at startup; writes timestamped ERROR lines
+//! to a log file (defaults to `tune.log` in the working directory).
+//!
+//! Opens and closes the file on every write so the log is visible
+//! immediately without needing to close the app.
+//!
+//! # Usage
+//! ```ignore
+//! log::init("tune.log");
+//! log_error!("something went wrong: {}", err);
+//! ```
 
 use std::sync::OnceLock;
 

@@ -146,9 +146,9 @@ fn parse_lrc_lines(text: &str) -> Vec<LyricLine> {
         }
 
         // LRC: [mm:ss.xx]text or [mm:ss.xxx]text
-        if let Some(rest) = line.strip_prefix('[') {
-            if let Some((ts_str, remaining)) = rest.split_once(']') {
-                if let Some(ms) = parse_lrc_timestamp(ts_str.trim()) {
+        if let Some(rest) = line.strip_prefix('[')
+            && let Some((ts_str, remaining)) = rest.split_once(']')
+                && let Some(ms) = parse_lrc_timestamp(ts_str.trim()) {
                     let lyric_text = remaining.trim().to_string();
                     lines.push(LyricLine {
                         timestamp_ms: ms,
@@ -160,8 +160,6 @@ fn parse_lrc_lines(text: &str) -> Vec<LyricLine> {
                     });
                     continue;
                 }
-            }
-        }
 
         // Also handle "[mm:ss.xx] [mm:ss.xx]text" — multiple timestamps for one line
         // This is a simplified version; multi-timestamp lines are complex.

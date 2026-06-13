@@ -19,7 +19,6 @@ impl Language {
         }
     }
 
-    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Language::Zh => "zh",
@@ -27,7 +26,6 @@ impl Language {
         }
     }
 
-    #[allow(dead_code)]
     pub fn toggle(self) -> Self {
         match self {
             Language::Zh => Language::En,
@@ -39,11 +37,11 @@ impl Language {
 /// Initialise the global language from a config string ("zh" / "en").
 /// Can be called multiple times to switch language at runtime.
 pub fn init(lang: &str) {
-    *LANG.lock().unwrap() = Language::from_str(lang);
+    *LANG.lock().expect("LANG mutex poisoned") = Language::from_str(lang);
 }
 
 pub fn current() -> Language {
-    *LANG.lock().unwrap()
+    *LANG.lock().expect("LANG mutex poisoned")
 }
 
 /// Look up a translation key in the current language.
@@ -137,6 +135,7 @@ fn zh(key: &str) -> &str {
         "status.jumped_to" => "已跳转到: {}",
         "status.jumped_to_playlist" => "已跳转到: {} — {}",
         "status.resuming" => "↻ 继续播放: {}",
+        "status.last_played" => "上次播放: {}",
         "status.sort_changed" => "排序: {}",
         "status.filter_artist" => "筛选艺术家: {}",
         "status.filter_cleared" => "已清除艺术家筛选",
@@ -307,6 +306,7 @@ fn en(key: &str) -> &str {
         "status.jumped_to" => "Jumped to: {}",
         "status.jumped_to_playlist" => "Jumped to: {} — {}",
         "status.resuming" => "↻ Resuming: {}",
+        "status.last_played" => "Last played: {}",
         "status.sort_changed" => "Sort: {}",
         "status.filter_artist" => "Filtering by artist: {}",
         "status.filter_cleared" => "Artist filter cleared",

@@ -1,8 +1,8 @@
-/// 文件闪传 (Fast File Transfer) adapter.
-///
-/// Endpoints:
-/// - `GET {base}/musicsV2` → `{ children: [...] }`
-/// - `GET {base}/file?path={encoded_path}` → audio stream
+//! 文件闪传 (Fast File Transfer) adapter.
+//!
+//! Endpoints:
+//! - `GET {base}/musicsV2` → `{ children: [...] }`
+//! - `GET {base}/file?path={encoded_path}` → audio stream
 
 use anyhow::Result;
 use async_trait::async_trait;

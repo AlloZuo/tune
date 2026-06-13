@@ -64,8 +64,6 @@ pub(crate) static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MusicEntry {
-    #[allow(dead_code)]
-    pub id: u64,
     #[serde(rename = "absoultePath")]
     pub absolute_path: String,
     pub name: String,
@@ -75,8 +73,6 @@ pub struct MusicEntry {
     /// Album name (populated by servers that support grouping).
     #[serde(default)]
     pub album: String,
-    #[allow(dead_code)]
-    pub size: u64,
     /// Which server this entry came from (set by ServerPool).
     #[serde(default)]
     pub server_id: String,
