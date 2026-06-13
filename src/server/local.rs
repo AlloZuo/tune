@@ -139,6 +139,17 @@ impl MusicServer for LocalServer {
         music.absolute_path.clone()
     }
 
+    async fn fetch_cover_data(&self, music: &MusicEntry) -> Option<Vec<u8>> {
+        use lofty::file::TaggedFileExt;
+        use lofty::probe::Probe;
+
+        let file = Probe::open(&music.absolute_path).ok()?.read().ok()?;
+        let tag = file.primary_tag().or_else(|| file.first_tag())?;
+        let picture = tag.pictures().first()?;
+        let data = picture.data();
+        if data.is_empty() { None } else { Some(data.to_vec()) }
+    }
+
     async fn fetch_audio(&self, music: &MusicEntry) -> Result<Vec<u8>> {
         let data = tokio::fs::read(&music.absolute_path).await?;
         Ok(data)

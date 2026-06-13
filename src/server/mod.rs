@@ -174,6 +174,21 @@ pub trait MusicServer: Send + Sync {
         None
     }
 
+    /// Fetch raw cover art image bytes (JPEG/PNG) for a music entry.
+    ///
+    /// Default implementation downloads from `cover_url()` if available.
+    /// Override for servers that can extract cover from embedded metadata
+    /// (e.g. local files, file-transfer).
+    async fn fetch_cover_data(&self, music: &MusicEntry) -> Option<Vec<u8>> {
+        let url = self.cover_url(music)?;
+        let response = HTTP.get(&url).send().await.ok()?;
+        let status = response.status();
+        if !status.is_success() {
+            return None;
+        }
+        response.bytes().await.ok().map(|b| b.to_vec())
+    }
+
     /// Fetch lyrics from the server (optional).
     /// Default returns `None`; override if the server provides a lyrics API.
     async fn fetch_lyrics(&self, _music: &MusicEntry) -> Option<Lyrics> {
@@ -318,6 +333,13 @@ impl MusicServer for ServerPool {
     fn cover_url(&self, music: &MusicEntry) -> Option<String> {
         self.find(&music.server_id)
             .and_then(|s| s.cover_url(music))
+    }
+
+    async fn fetch_cover_data(&self, music: &MusicEntry) -> Option<Vec<u8>> {
+        match self.find(&music.server_id) {
+            Some(server) => server.fetch_cover_data(music).await,
+            None => None,
+        }
     }
 
     async fn fetch_lyrics(&self, music: &MusicEntry) -> Option<Lyrics> {
