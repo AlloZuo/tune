@@ -1,16 +1,15 @@
-use std::sync::LazyLock;
-
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, BorderType, Borders, Clear, Gauge, List, ListDirection, ListItem, Paragraph,
+        Block, BorderType, Borders, Clear, Gauge, List, ListDirection, ListItem, ListState, Paragraph,
     },
     Frame,
 };
 
 use crate::player::PlayerState;
+use crate::server::MusicEntry;
 
 use super::{App, DisplayItem, PlayingSource, SortMode, ViewMode};
 
@@ -87,6 +86,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             .playlists
             .get(pl_idx)
             .map(|pl| format!("  🎵{}", pl.name))
+            // safe: .get() returns None for invalid pl_idx → empty string fallback
             .unwrap_or_default(),
         _ => String::new(),
     };
@@ -127,38 +127,10 @@ fn render_music_list(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|(i, item)| match item {
             DisplayItem::Song(data_idx) => {
                 let music = &app.filtered_music[*data_idx];
-                let is_selected = Some(i) == selected;
-                let name = music.name.clone();
-                let artist = if music.artist == "<unknown>" || music.artist.is_empty() {
-                    crate::tf!("app.unknown_artist")
-                } else {
-                    music.artist.clone()
-                };
-                let dur = format_duration(music.duration);
-
-                let mut spans = vec![
-                    Span::styled(name, Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw("  "),
-                    Span::styled(artist, Style::new().fg(Color::DarkGray)),
-                    Span::raw("  "),
-                    Span::styled(dur, Style::new().fg(Color::Gray)),
-                ];
-                // Show album name in non-grouped mode too
-                if !is_grouped && !music.album.is_empty() {
-                    spans.push(Span::raw("  "));
-                    spans.push(Span::styled(
-                        music.album.clone(),
-                        Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                    ));
-                }
-
-                let content = Line::from(spans);
-
-                if is_selected {
-                    ListItem::new(content).style(Style::new().bg(Color::Blue).fg(Color::White))
-                } else {
-                    ListItem::new(content)
-                }
+                let is_playing = app.player
+                    .current_track()
+                    .is_some_and(|t| t.absolute_path == music.absolute_path);
+                song_to_list_item(i, music, selected, !is_grouped, is_playing)
             }
             DisplayItem::AlbumHeader {
                 album,
@@ -201,19 +173,7 @@ fn render_music_list(frame: &mut Frame, area: Rect, app: &mut App) {
         title
     };
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .title(title.trim())
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(Color::Cyan)),
-        )
-        .direction(ListDirection::TopToBottom)
-        .highlight_symbol("▸ ")
-        .highlight_style(Style::new().bg(Color::Blue).fg(Color::White));
-
-    frame.render_stateful_widget(list, area, &mut app.list_state);
+    render_song_list(frame, area, items, title.trim().to_string(), &mut app.list_state);
 }
 
 // ── Playlist list ──
@@ -306,7 +266,7 @@ fn render_playlist_content(frame: &mut Frame, area: Rect, app: &mut App) {
 
     // Reset selection if it exceeds filtered list
     let selected = app.pl_content_state.selected();
-    if selected.map_or(false, |s| s >= songs.len()) {
+    if selected.is_some_and(|s| s >= songs.len()) {
         app.pl_content_state.select(Some(songs.len().saturating_sub(1)));
     }
 
@@ -314,28 +274,10 @@ fn render_playlist_content(frame: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .enumerate()
         .map(|(i, music)| {
-            let is_selected = Some(i) == selected;
-            let name = music.name.clone();
-            let artist = if music.artist == "<unknown>" || music.artist.is_empty() {
-                crate::tf!("app.unknown_artist")
-            } else {
-                music.artist.clone()
-            };
-            let dur = format_duration(music.duration);
-
-            let content = Line::from(vec![
-                Span::styled(name, Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled(artist, Style::new().fg(Color::DarkGray)),
-                Span::raw("  "),
-                Span::styled(dur, Style::new().fg(Color::Gray)),
-            ]);
-
-            if is_selected {
-                ListItem::new(content).style(Style::new().bg(Color::Blue).fg(Color::White))
-            } else {
-                ListItem::new(content)
-            }
+            let is_playing = app.player
+                .current_track()
+                .is_some_and(|t| t.absolute_path == music.absolute_path);
+            song_to_list_item(i, music, selected, false, is_playing)
         })
         .collect();
 
@@ -346,6 +288,65 @@ fn render_playlist_content(frame: &mut Frame, area: Rect, app: &mut App) {
         format!(" {} ", crate::tf!("view.search_results", &app.search_query, items.len()))
     };
 
+    render_song_list(frame, area, items, title, &mut app.pl_content_state);
+}
+
+// ── Shared song rendering helpers ──
+
+fn song_to_list_item(
+    i: usize,
+    music: &MusicEntry,
+    selected: Option<usize>,
+    show_album: bool,
+    is_playing: bool,
+) -> ListItem<'_> {
+    let is_selected = Some(i) == selected;
+    let name = music.name.clone();
+    let artist = if music.artist == "<unknown>" || music.artist.is_empty() {
+        crate::tf!("app.unknown_artist")
+    } else {
+        music.artist.clone()
+    };
+    let dur = format_duration(music.duration);
+
+    let mut spans: Vec<Span<'_>> = Vec::with_capacity(8);
+    if is_playing {
+        spans.push(Span::styled("▶ ", Style::new().fg(Color::Green)));
+    }
+    spans.push(Span::styled(name, Style::new().add_modifier(Modifier::BOLD)));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(artist, Style::new().fg(Color::DarkGray)));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(dur, Style::new().fg(Color::Gray)));
+
+    if show_album && !music.album.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            music.album.clone(),
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ));
+    }
+
+    let content = Line::from(spans);
+
+    if is_playing && is_selected {
+        ListItem::new(content).style(Style::new().bg(Color::Blue).fg(Color::LightGreen))
+    } else if is_playing {
+        ListItem::new(content).style(Style::new().fg(Color::Green))
+    } else if is_selected {
+        ListItem::new(content).style(Style::new().bg(Color::Blue).fg(Color::White))
+    } else {
+        ListItem::new(content)
+    }
+}
+
+fn render_song_list(
+    frame: &mut Frame,
+    area: Rect,
+    items: Vec<ListItem>,
+    title: String,
+    list_state: &mut ListState,
+) {
     let list = List::new(items)
         .block(
             Block::default()
@@ -358,7 +359,7 @@ fn render_playlist_content(frame: &mut Frame, area: Rect, app: &mut App) {
         .highlight_symbol("▸ ")
         .highlight_style(Style::new().bg(Color::Blue).fg(Color::White));
 
-    frame.render_stateful_widget(list, area, &mut app.pl_content_state);
+    frame.render_stateful_widget(list, area, list_state);
 }
 
 // ── Status bar ──
@@ -593,18 +594,13 @@ fn build_help_lines() -> Vec<String> {
     ]
 }
 
-static HELP_EN: LazyLock<Vec<String>> = LazyLock::new(build_help_lines);
-static HELP_ZH: LazyLock<Vec<String>> = LazyLock::new(build_help_lines);
-
 fn render_help_overlay(frame: &mut Frame, area: Rect, _app: &App) {
     let overlay_area = centered_rect_lines(35, area);
     frame.render_widget(Clear, overlay_area);
 
-    let help_text = if crate::i18n::current() == crate::i18n::Language::En {
-        &*HELP_EN
-    } else {
-        &*HELP_ZH
-    };
+    // Rebuild on every call: the function is only called when user presses `h`,
+    // so caching adds complexity (language-switch invalidation) for negligible gain.
+    let help_text = build_help_lines();
 
     let lines: Vec<Line> = help_text
         .iter()
@@ -729,6 +725,7 @@ fn render_config_edit(frame: &mut Frame, area: Rect, app: &App) {
                 format!(" {} ", type_val)
             }
         } else if idx == 4 && !is_focused {
+            // safe: .get() returns None for missing/out-of-range idx → 0-length mask
             let len = app.config_inputs.get(idx).map(|s| s.len()).unwrap_or(0);
             "*".repeat(len.min(20))
         } else {
