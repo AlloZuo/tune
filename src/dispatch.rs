@@ -4,11 +4,11 @@
 // search, config, queue, and system commands.
 
 use crate::player::PlayerState;
-use crate::server::create_server_pool;
+use crate::server::{create_server_pool, MusicEntry};
 use crate::store::{save_playlists, save_servers};
 use crate::ui::{App, AppEvent, PlayingSource, ViewMode};
 
-use crate::message::MainMessage;
+use crate::message::{CoverArt, MainMessage};
 use crate::playback::{start_playback, start_playback_inner, start_playback_entry, refresh_music_list, handle_auto_next, advance_sequential, advance_shuffle};
 
 use tokio::sync::mpsc;

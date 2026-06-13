@@ -279,102 +279,97 @@ impl App {
     }
 
     fn handle_overlay_or_normal(&mut self, key: KeyCode) -> Option<AppEvent> {
-        // ── Help overlay (any key dismisses) ──
+        // Each overlay has its own handler; normal mode falls through.
+        if self.show_cover {
+            return self.handle_cover_key(key);
+        }
         if self.show_help {
-            self.show_help = false;
-            return None;
+            return self.handle_help_key(key);
         }
-
-        // ── Quit confirmation overlay ──
         if self.confirm_quit {
-            return match key {
-                KeyCode::Char('y' | 'Y') => Some(AppEvent::Quit),
-                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                    self.confirm_quit = false;
-                    None
-                }
-                _ => None,
-            };
+            return self.handle_quit_confirm_key(key);
         }
-
-        // ── Search mode ──
         if self.search_mode {
-            return match key {
-                KeyCode::Enter => Some(AppEvent::ConfirmSearch),
-                KeyCode::Esc => Some(AppEvent::CancelSearch),
-                KeyCode::Backspace => Some(AppEvent::DeleteSearchChar),
-                KeyCode::Char(c) => Some(AppEvent::PushSearchChar(c)),
-                _ => None,
-            };
+            return self.handle_search_key(key);
         }
-
-        // ── Normal mode key dispatch ──
         self.handle_normal_key(key)
     }
 
+    // ── Overlay sub-handlers ──
+
+    fn handle_cover_key(&mut self, key: KeyCode) -> Option<AppEvent> {
+        match key {
+            // C again or Esc dismisses
+            KeyCode::Char('C') | KeyCode::Esc => {
+                self.show_cover = false;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_help_key(&mut self, _key: KeyCode) -> Option<AppEvent> {
+        self.show_help = false;
+        None
+    }
+
+    fn handle_quit_confirm_key(&mut self, key: KeyCode) -> Option<AppEvent> {
+        match key {
+            KeyCode::Char('y' | 'Y') => Some(AppEvent::Quit),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                self.confirm_quit = false;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyCode) -> Option<AppEvent> {
+        match key {
+            KeyCode::Enter => Some(AppEvent::ConfirmSearch),
+            KeyCode::Esc => Some(AppEvent::CancelSearch),
+            KeyCode::Backspace => Some(AppEvent::DeleteSearchChar),
+            KeyCode::Char(c) => Some(AppEvent::PushSearchChar(c)),
+            _ => None,
+        }
+    }
+
+    // ── Normal mode ──
+
     fn handle_normal_key(&mut self, key: KeyCode) -> Option<AppEvent> {
         match key {
-            // Global: first press shows confirmation
-            KeyCode::Char('q') => {
-                self.confirm_quit = true;
-                None
+            // ── Global / system ──
+            KeyCode::Char('q') | KeyCode::Esc if self.view_mode == ViewMode::Browse => {
+                return self.handle_quit_request(key);
             }
-            KeyCode::Esc if self.view_mode == ViewMode::Browse => {
-                self.confirm_quit = true;
-                None
-            }
-            KeyCode::Esc => match self.view_mode {
-                ViewMode::Browse => Some(AppEvent::Quit),
-                ViewMode::PlaylistList => {
-                    self.view_mode = ViewMode::Browse;
-                    Some(AppEvent::None)
-                }
-                ViewMode::PlaylistContent(_) => {
-                    self.view_mode = ViewMode::PlaylistList;
-                    Some(AppEvent::None)
-                }
-            },
+            KeyCode::Esc => return self.handle_esc(key),
 
-            // Navigation
+            // ── Navigation ──
             KeyCode::Up => Some(AppEvent::MoveUp),
             KeyCode::Down => Some(AppEvent::MoveDown),
             KeyCode::PageUp => Some(AppEvent::ScrollUp),
             KeyCode::PageDown => Some(AppEvent::ScrollDown),
+            KeyCode::Char('g') => Some(AppEvent::GoToPlaying),
 
-            // Playback control
-            KeyCode::Enter => match self.view_mode {
-                ViewMode::Browse | ViewMode::PlaylistContent(_) => Some(AppEvent::PlaySelected),
-                ViewMode::PlaylistList => {
-                    let idx = self.pl_list_state.selected().unwrap_or(0);
-                    if idx < self.playlists.len() {
-                        self.view_mode = ViewMode::PlaylistContent(idx);
-                        self.pl_content_state.select(Some(0));
-                    }
-                    Some(AppEvent::None)
-                }
-            },
+            // ── Search trigger ──
+            KeyCode::Char('/')
+                if matches!(self.view_mode, ViewMode::Browse | ViewMode::PlaylistContent(_)) =>
+            {
+                Some(AppEvent::EnterSearch)
+            }
+
+            // ── Playback ──
+            KeyCode::Enter => Some(self.handle_enter_key()),
             KeyCode::Char(' ') => Some(AppEvent::TogglePlayback),
             KeyCode::Char('s') => Some(AppEvent::Stop),
             KeyCode::Right => Some(AppEvent::SeekForward),
             KeyCode::Left => Some(AppEvent::SeekBackward),
-
-            // Play mode
             KeyCode::Char('m') => Some(AppEvent::CyclePlayMode),
-
-            // Volume
+            KeyCode::Char('n') => Some(AppEvent::NextTrack),
             KeyCode::Char('+') | KeyCode::Char('=') => Some(AppEvent::VolumeUp),
             KeyCode::Char('-') | KeyCode::Char('_') => Some(AppEvent::VolumeDown),
 
-            // Search
-            KeyCode::Char('/') if matches!(self.view_mode, ViewMode::Browse | ViewMode::PlaylistContent(_)) => {
-                Some(AppEvent::EnterSearch)
-            }
-
-            // Refresh / Config / GoToPlaying / Sort
-            KeyCode::Char('r') => Some(AppEvent::Refresh),
-            KeyCode::Char('R') => Some(AppEvent::ConfigureServer),
-            KeyCode::Char('g') => Some(AppEvent::GoToPlaying),
-            KeyCode::Char('S') => Some(AppEvent::CycleSort),
+            // ── Artist filter ──
             KeyCode::Char('f') if self.view_mode == ViewMode::Browse => {
                 Some(AppEvent::FilterByArtist)
             }
@@ -382,37 +377,28 @@ impl App {
                 Some(AppEvent::ClearArtistFilter)
             }
 
-            // Playlists
-            KeyCode::Char('l') => {
-                match self.view_mode {
-                    ViewMode::Browse => {
-                        self.view_mode = ViewMode::PlaylistList;
-                        self.pl_list_state.select(Some(0));
-                    }
-                    ViewMode::PlaylistList => self.view_mode = ViewMode::Browse,
-                    ViewMode::PlaylistContent(_) => self.view_mode = ViewMode::PlaylistList,
-                }
-                Some(AppEvent::None)
-            }
-            KeyCode::Char('c') if matches!(self.view_mode, ViewMode::PlaylistList) => {
+            // ── View / sort ──
+            KeyCode::Char('r') => Some(AppEvent::Refresh),
+            KeyCode::Char('R') => Some(AppEvent::ConfigureServer),
+            KeyCode::Char('S') => Some(AppEvent::CycleSort),
+            KeyCode::Char('h' | '?') => Some(AppEvent::ShowHelp),
+            KeyCode::Char('L') => Some(AppEvent::ToggleLanguage),
+            KeyCode::Char('C') => Some(AppEvent::ToggleCover),
+
+            // ── Playlist management ──
+            KeyCode::Char('l') => Some(self.handle_playlist_toggle_key()),
+            KeyCode::Char('c') if self.view_mode == ViewMode::PlaylistList => {
                 Some(AppEvent::CreatePlaylist)
             }
-            KeyCode::Char('a') if matches!(self.view_mode, ViewMode::Browse) && self.selected_music().is_some() => {
-                if self.playlists.len() <= 1 {
-                    self.pick_index = 0;
-                    Some(AppEvent::AddToPlaylist)
-                } else {
-                    self.picking_playlist = true;
-                    self.pick_index = 0;
-                    None
-                }
+            KeyCode::Char('a') if self.view_mode == ViewMode::Browse && self.selected_music().is_some() => {
+                self.handle_add_to_playlist_key()
             }
             KeyCode::Char('d') => match self.view_mode {
                 ViewMode::PlaylistList | ViewMode::PlaylistContent(_) => Some(AppEvent::DeleteItem),
                 _ => None,
             },
 
-            // Queue
+            // ── Play queue (from normal mode) ──
             KeyCode::Char('x')
                 if matches!(self.view_mode, ViewMode::Browse | ViewMode::PlaylistContent(_))
                     && self.selected_in_current_view().is_some() =>
@@ -434,12 +420,65 @@ impl App {
                 }
             }
 
-            // Next track
-            KeyCode::Char('n') => Some(AppEvent::NextTrack),
-
-            KeyCode::Char('h' | '?') => Some(AppEvent::ShowHelp),
-            KeyCode::Char('L') => Some(AppEvent::ToggleLanguage),
             _ => None,
+        }
+    }
+
+    // ── Normal-mode sub-handlers ──
+
+    fn handle_quit_request(&mut self, _key: KeyCode) -> Option<AppEvent> {
+        self.confirm_quit = true;
+        None
+    }
+
+    fn handle_esc(&mut self, _key: KeyCode) -> Option<AppEvent> {
+        match self.view_mode {
+            ViewMode::Browse => Some(AppEvent::Quit),
+            ViewMode::PlaylistList => {
+                self.view_mode = ViewMode::Browse;
+                Some(AppEvent::None)
+            }
+            ViewMode::PlaylistContent(_) => {
+                self.view_mode = ViewMode::PlaylistList;
+                Some(AppEvent::None)
+            }
+        }
+    }
+
+    fn handle_enter_key(&mut self) -> AppEvent {
+        match self.view_mode {
+            ViewMode::Browse | ViewMode::PlaylistContent(_) => AppEvent::PlaySelected,
+            ViewMode::PlaylistList => {
+                let idx = self.pl_list_state.selected().unwrap_or(0);
+                if idx < self.playlists.len() {
+                    self.view_mode = ViewMode::PlaylistContent(idx);
+                    self.pl_content_state.select(Some(0));
+                }
+                AppEvent::None
+            }
+        }
+    }
+
+    fn handle_playlist_toggle_key(&mut self) -> AppEvent {
+        match self.view_mode {
+            ViewMode::Browse => {
+                self.view_mode = ViewMode::PlaylistList;
+                self.pl_list_state.select(Some(0));
+            }
+            ViewMode::PlaylistList => self.view_mode = ViewMode::Browse,
+            ViewMode::PlaylistContent(_) => self.view_mode = ViewMode::PlaylistList,
+        }
+        AppEvent::None
+    }
+
+    fn handle_add_to_playlist_key(&mut self) -> Option<AppEvent> {
+        if self.playlists.len() <= 1 {
+            self.pick_index = 0;
+            Some(AppEvent::AddToPlaylist)
+        } else {
+            self.picking_playlist = true;
+            self.pick_index = 0;
+            None
         }
     }
 }
