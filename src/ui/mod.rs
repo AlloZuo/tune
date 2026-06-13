@@ -5,6 +5,7 @@ pub use render::draw;
 pub use render::format_duration;
 
 use ratatui::widgets::ListState;
+use tokio::task::AbortHandle;
 
 use crate::server::{MusicEntry, MusicServer, ServerConfig};
 use crate::player::Player;
@@ -184,6 +185,11 @@ pub struct App {
     /// Used to resume from a saved position on startup.
     pub resume_position_ms: Option<u64>,
 
+    // ── Background task tracking ──
+    /// Handles for all spawned background tasks (downloads, seeks, lyrics, etc.).
+    /// Aborted on quit to prevent orphan tasks.
+    pub background_tasks: Vec<tokio::task::AbortHandle>,
+
     // ── Sort ──
     pub sort_mode: SortMode,
 
@@ -236,6 +242,7 @@ impl App {
             sort_mode: SortMode::Default,
             artist_filter: None,
             display_items: Vec::new(),
+            background_tasks: Vec::new(),
         }
     }
 
@@ -287,11 +294,11 @@ impl App {
             SortMode::Default => {} // keep server/addition order
             SortMode::Name => {
                 self.filtered_music
-                    .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    .sort_by_key(|a| a.name.to_lowercase());
             }
             SortMode::Artist => {
                 self.filtered_music
-                    .sort_by(|a, b| a.artist.to_lowercase().cmp(&b.artist.to_lowercase()));
+                    .sort_by_key(|a| a.artist.to_lowercase());
             }
             SortMode::Duration => {
                 self.filtered_music.sort_by_key(|m| m.duration);
@@ -392,15 +399,14 @@ impl App {
     }
 
     pub fn add_to_playlist(&mut self, pl_idx: usize, music: MusicEntry) {
-        if pl_idx < self.playlists.len() {
-            if !self.playlists[pl_idx]
+        if pl_idx < self.playlists.len()
+            && !self.playlists[pl_idx]
                 .songs
                 .iter()
                 .any(|s| s.absolute_path == music.absolute_path)
             {
                 self.playlists[pl_idx].songs.push(music);
             }
-        }
     }
 
     pub fn create_playlist(&mut self, name: String) {
@@ -432,12 +438,11 @@ impl App {
     }
 
     pub fn remove_song_from_current_playlist(&mut self, song_idx: usize) -> bool {
-        if let Some(pl) = self.current_playlist_mut() {
-            if song_idx < pl.songs.len() {
+        if let Some(pl) = self.current_playlist_mut()
+            && song_idx < pl.songs.len() {
                 pl.songs.remove(song_idx);
                 return true;
             }
-        }
         false
     }
 
@@ -582,6 +587,20 @@ impl App {
                 })
                 .cloned()
                 .collect()
+        }
+    }
+
+    /// Register a spawned task so it gets cancelled on quit.
+    /// Call `tokio::spawn(...)` and pass the `JoinHandle::abort_handle()` here.
+    pub fn track_background_task(&mut self, handle: AbortHandle) {
+        // Keep the handle alive; expired handles are fine — abort on a completed task is a no-op.
+        self.background_tasks.push(handle);
+    }
+
+    /// Cancel all tracked background tasks (called on quit).
+    pub fn cancel_background_tasks(&mut self) {
+        for handle in self.background_tasks.drain(..) {
+            handle.abort();
         }
     }
 

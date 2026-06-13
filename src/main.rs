@@ -32,7 +32,7 @@ use store::{load_playlists, load_servers};
 use ui::{draw, format_duration, App, AppEvent, PlayingSource};
 
 use dispatch::handle_app_action;
-use playback::{handle_auto_next, start_playback_entry, refresh_music_list, on_play_started};
+use playback::{handle_auto_next, refresh_music_list, on_play_started};
 
 // ── Background messages ──
 // (defined in download.rs)
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
         app.config_mode = true;
         app.status_message = tf!("app.config_prompt");
     } else {
-        refresh_music_list(&app, &msg_tx);
+        refresh_music_list(&mut app, &msg_tx);
     }
 
     // ── Main loop ──
@@ -86,28 +86,18 @@ async fn main() -> Result<()> {
             match msg {
                 MainMessage::MusicListLoaded(list) => {
                     app.set_music_list(list);
-                    // Restore last playback position, if any
-                    if app.playing_source.is_none() {
-                        if let Some(last) = store::load_last_played() {
-                            let music = app.all_music.iter().find(|m| {
+                    // Remember which song was last played (so "g" works) but
+                    // don't auto-play — wait for the user to press Enter.
+                    if app.playing_source.is_none()
+                        && let Some(last) = store::load_last_played() {
+                            if let Some(idx) = app.all_music.iter().position(|m| {
                                 m.server_id == last.server_id && m.absolute_path == last.absolute_path
-                            }).cloned();
-                            if let Some(music) = music {
-                                // Set playing_source so GoToPlaying ("g") works
-                                if let Some(idx) = app.all_music.iter().position(|m| m.absolute_path == music.absolute_path) {
-                                    app.playing_source = Some(PlayingSource::Browse(idx));
-                                }
-                                app.resume_position_ms = if last.position_ms > 0 {
-                                    app.status_message = tf!("status.resuming", &music.name);
-                                    Some(last.position_ms)
-                                } else {
-                                    None
-                                };
-                                start_playback_entry(&mut app, msg_tx.clone(), music);
-                                let _ = store::clear_last_played();
+                            }) {
+                                app.playing_source = Some(PlayingSource::Browse(idx));
+                                app.status_message = tf!("status.last_played", &app.all_music[idx].name);
                             }
+                            let _ = store::clear_last_played();
                         }
-                    }
                 }
                 MainMessage::MusicListLoadFailed(err) => {
                     app.error_message = Some(err);
@@ -189,6 +179,7 @@ async fn main() -> Result<()> {
                         let track = TrackInfo {
                             title: music.name.clone(),
                             artist: music.artist.clone(),
+                            absolute_path: music.absolute_path.clone(),
                             total_duration_ms: music.duration,
                             lyrics,
                         };
@@ -248,6 +239,8 @@ async fn main() -> Result<()> {
                         let needs_yield = handle_app_action(action, &mut app, &msg_tx);
 
                         if action == AppEvent::Quit {
+                            // Cancel all background tasks first
+                            app.cancel_background_tasks();
                             // Save playback position before quitting
                             let music = match app.playing_source {
                                 Some(PlayingSource::Browse(idx)) => app.filtered_music.get(idx),
@@ -264,6 +257,7 @@ async fn main() -> Result<()> {
                                 });
                             }
                             let _ = store::save_volume(app.player.volume());
+                            store::flush_config();
                             break 'main;
                         }
 

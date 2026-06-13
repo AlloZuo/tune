@@ -1,9 +1,9 @@
-/// Local file system music server adapter.
-///
-/// Reads music files from a local directory path (no network required).
-/// Useful for playing music stored on the same machine.
-///
-/// Supported audio formats: mp3, flac, ogg, wav, m4a, wma, aac, opus, aiff.
+//! Local file system music server adapter.
+//!
+//! Reads music files from a local directory path (no network required).
+//! Useful for playing music stored on the same machine.
+//!
+//! Supported audio formats: mp3, flac, ogg, wav, m4a, wma, aac, opus, aiff.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -60,48 +60,49 @@ impl MusicServer for LocalServer {
             cover_art: false,
         }
     }
-
     async fn fetch_list(&self) -> Result<Vec<MusicEntry>> {
-        let mut entries = Vec::new();
-        let root = Path::new(&self.root);
-
-        if !root.exists() {
+        let root = Path::new(&self.root).to_path_buf();
+        let root_str = self.root.clone();
+        if !Path::new(&root_str).exists() {
             anyhow::bail!("路径不存在: {}", self.root);
         }
-        if !root.is_dir() {
+        if !Path::new(&root_str).is_dir() {
             anyhow::bail!("不是文件夹: {}", self.root);
         }
 
-        let mut id_counter = 0u64;
-        let walk_dir = |path: &Path| -> std::io::Result<Vec<std::path::PathBuf>> {
-            let mut files = Vec::new();
-            let mut dirs = vec![path.to_path_buf()];
-            while let Some(dir) = dirs.pop() {
-                if let Ok(read) = std::fs::read_dir(&dir) {
-                    for entry in read.flatten() {
-                        let p = entry.path();
-                        if p.is_dir() {
-                            dirs.push(p);
-                        } else if p.is_file() {
-                            files.push(p);
+        // Run blocking directory walk on a dedicated thread to avoid
+        // stalling the tokio worker pool on large libraries.
+        let entries = tokio::task::spawn_blocking(move || -> Result<Vec<MusicEntry>> {
+            let walk_dir = |path: &Path| -> std::io::Result<Vec<std::path::PathBuf>> {
+                let mut files = Vec::new();
+                let mut dirs = vec![path.to_path_buf()];
+                while let Some(dir) = dirs.pop() {
+                    if let Ok(read) = std::fs::read_dir(&dir) {
+                        for entry in read.flatten() {
+                            let p = entry.path();
+                            if p.is_dir() {
+                                dirs.push(p);
+                            } else if p.is_file() {
+                                files.push(p);
+                            }
                         }
                     }
                 }
-            }
-            Ok(files)
-        };
+                Ok(files)
+            };
 
-        let files = walk_dir(root)?;
-        for file_path in files {
-            if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
-                if AUDIO_EXTS.contains(&ext.to_lowercase().as_str()) {
-                    id_counter += 1;
+            let mut entries = Vec::new();
+            let files = walk_dir(&root)?;
+
+            for file_path in files {
+                if let Some(ext) = file_path.extension().and_then(|e| e.to_str())
+                    && AUDIO_EXTS.contains(&ext.to_lowercase().as_str())
+                {
                     let absolute_path = file_path.to_string_lossy().to_string();
                     let file_stem = file_path
                         .file_stem()
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    // Use parent directory name as artist hint
                     let artist = file_path
                         .parent()
                         .and_then(|p| p.file_name())
@@ -111,21 +112,25 @@ impl MusicServer for LocalServer {
                     let duration = probe_duration(&absolute_path);
 
                     entries.push(MusicEntry {
-                        id: id_counter,
                         absolute_path,
                         name: file_stem,
                         artist,
                         album: String::new(),
                         duration,
-                        size: 0,
                         server_id: String::new(),
                     });
                 }
             }
-        }
+
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("walk_dir thread panicked: {}", e))?
+        .map_err(|e| anyhow::anyhow!("walk_dir failed: {}", e))?;
 
         Ok(entries)
     }
+
 
     fn stream_url(&self, music: &MusicEntry) -> String {
         // Return the local file path directly.

@@ -42,7 +42,7 @@ pub(crate) fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Send
             // Spawn background decode so the UI stays responsive
             if let Some((data, pos_ms)) = app.player.extract_seek_data(5) {
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     match crate::player::decode_seek_source(data, pos_ms).await {
                         Ok(source) => {
                             let _ = tx
@@ -56,6 +56,7 @@ pub(crate) fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Send
                         }
                     }
                 });
+                app.track_background_task(handle.abort_handle());
             } else {
                 app.status_message = crate::tf!("status.seek_unavailable");
             }
@@ -64,7 +65,7 @@ pub(crate) fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Send
         AppEvent::SeekBackward => {
             if let Some((data, pos_ms)) = app.player.extract_seek_data(-5) {
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     match crate::player::decode_seek_source(data, pos_ms).await {
                         Ok(source) => {
                             let _ = tx
@@ -78,6 +79,7 @@ pub(crate) fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Send
                         }
                     }
                 });
+                app.track_background_task(handle.abort_handle());
             } else {
                 app.status_message = crate::tf!("status.seek_unavailable");
             }
@@ -121,10 +123,6 @@ pub(crate) fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Send
 
         // ── Go to playing ──
         AppEvent::GoToPlaying => {
-            if app.player.is_stopped() {
-                app.status_message = crate::tf!("app.no_playing");
-                return false;
-            }
             match app.playing_source {
                 Some(PlayingSource::Browse(idx)) => {
                     app.view_mode = ViewMode::Browse;
@@ -138,15 +136,14 @@ pub(crate) fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Send
                 }
                 Some(PlayingSource::PlaylistContent(pl_idx, song_idx)) => {
                     app.view_mode = ViewMode::PlaylistContent(pl_idx);
-                    if let Some(pl) = app.playlists.get(pl_idx) {
-                        if song_idx < pl.songs.len() {
+                    if let Some(pl) = app.playlists.get(pl_idx)
+                        && song_idx < pl.songs.len() {
                             app.pl_content_state.select(Some(song_idx));
                             app.status_message = crate::tf!("status.jumped_to_playlist", &pl.name, &pl.songs[song_idx].name);
                         }
-                    }
                 }
                 None => {
-                    app.status_message = crate::tf!("app.unknown_source");
+                    app.status_message = crate::tf!("app.no_playing");
                 }
             }
             false
@@ -317,11 +314,10 @@ pub(crate) fn handle_app_action(action: AppEvent, app: &mut App, tx: &mpsc::Send
                         }
                     }
                     Some(PlayingSource::PlaylistContent(pl_idx, _)) => {
-                        if let Some(pl) = app.playlists.get(pl_idx) {
-                            if let Some(si) = pl.songs.iter().position(|s| s.absolute_path == *path) {
+                        if let Some(pl) = app.playlists.get(pl_idx)
+                            && let Some(si) = pl.songs.iter().position(|s| s.absolute_path == *path) {
                                 app.playing_source = Some(PlayingSource::PlaylistContent(pl_idx, si));
                             }
-                        }
                     }
                     None => {}
                 }

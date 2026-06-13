@@ -17,7 +17,7 @@ use crate::ui::{App, PlayingSource, ViewMode};
 pub(crate) fn handle_auto_next(app: &mut App, tx: &mpsc::Sender<MainMessage>) {
     // 1. Queue takes priority — consume queued songs first.
     if !app.player.queue.is_empty() {
-        let music = app.player.queue.pop_front().unwrap();
+        let music = app.player.queue.pop_front().expect("queue was empty after is_empty check");
         // Try to find the queued song in the current view so playing_source
         // stays correct for GoToPlaying ("g") and fallback auto-next.
         let queued_path = &music.absolute_path;
@@ -221,13 +221,12 @@ fn update_playing_source_index(app: &mut App, idx: usize) {
             } else {
                 // idx is a filtered-list index; resolve to real pl.songs index
                 let filtered = app.current_playlist_songs(pl_idx);
-                if let Some(song) = filtered.get(idx) {
-                    if let Some(real_idx) = app.playlists.get(pl_idx)
+                if let Some(song) = filtered.get(idx)
+                    && let Some(real_idx) = app.playlists.get(pl_idx)
                         .and_then(|pl| pl.songs.iter().position(|s| s.absolute_path == song.absolute_path))
                     {
                         app.playing_source = Some(PlayingSource::PlaylistContent(pl_idx, real_idx));
                     }
-                }
             }
         }
         None => {}
@@ -306,17 +305,29 @@ pub(crate) fn start_playback(app: &mut App, tx: mpsc::Sender<MainMessage>) {
 /// Spawn a background task that fetches server lyrics (with online fallback)
 /// and sends `LyricsReady` back to the main loop.
 /// Used so audio playback isn't blocked by lyrics network requests.
+/// Takes individual fields rather than a full `MusicEntry` to avoid unnecessary clones.
 pub(crate) fn spawn_lyrics_fetch(
     server: Arc<dyn MusicServer>,
-    music: MusicEntry,
+    music_name: String,
+    music_artist: String,
+    music_duration: u64,
     tx: mpsc::Sender<MainMessage>,
 ) {
     tokio::spawn(async move {
-        let server_lyrics = server.fetch_lyrics(&music).await;
+        // Build a minimal MusicEntry for the server trait call (only name/artist needed)
+        let entry = MusicEntry {
+            name: music_name,
+            artist: music_artist,
+            duration: music_duration,
+            absolute_path: String::new(),
+            album: String::new(),
+            server_id: String::new(),
+        };
+        let server_lyrics = server.fetch_lyrics(&entry).await;
         let lyrics = if server_lyrics.is_some() {
             server_lyrics
         } else {
-            crate::lyrics_online::search(&music.name, &music.artist, music.duration).await
+            crate::lyrics_online::search(&entry.name, &entry.artist, entry.duration).await
         };
         let _ = tx.send(MainMessage::LyricsReady(lyrics)).await;
     });
@@ -333,14 +344,12 @@ pub(crate) fn start_playback_inner(app: &mut App, tx: mpsc::Sender<MainMessage>,
     }
 
     // If it's the same track already playing, just re-seek (single-repeat case)
-    if let Some(cur) = app.player.current_track() {
-        if cur.title == music.name && cur.artist == music.artist {
-            if app.player.has_audio_data() {
+    if let Some(cur) = app.player.current_track()
+        && cur.title == music.name && cur.artist == music.artist
+            && app.player.has_audio_data() {
                 let _ = app.player.seek_to_ms(0);
                 return;
             }
-        }
-    }
 
     app.error_message = None;
     app.download_progress = None;
@@ -356,10 +365,12 @@ pub(crate) fn start_playback_inner(app: &mut App, tx: mpsc::Sender<MainMessage>,
         if cache.has(&music.server_id, &music.absolute_path) {
             app.downloading = true;
             app.status_message = crate::tf!("status.cache_reading", &music.name);
+            let music_name = music.name.clone();
+            let music_artist = music.artist.clone();
+            let music_duration = music.duration;
             let tx_for_lyrics = tx_clone.clone();
-            let music_for_lyrics = music.clone();
             let server_for_lyrics = server.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 match tokio::fs::read(cache.path_for(&music.server_id, &music.absolute_path)).await
                 {
                     Ok(data) => {
@@ -368,7 +379,7 @@ pub(crate) fn start_playback_inner(app: &mut App, tx: mpsc::Sender<MainMessage>,
                             .send(MainMessage::AudioDownloaded(music, data, None))
                             .await;
                         // Fetch lyrics in background
-                        spawn_lyrics_fetch(server_for_lyrics, music_for_lyrics, tx_for_lyrics);
+                        spawn_lyrics_fetch(server_for_lyrics, music_name, music_artist, music_duration, tx_for_lyrics);
                     }
                     Err(e) => {
                         // Corrupted cache entry — delete so next play retries
@@ -381,6 +392,7 @@ pub(crate) fn start_playback_inner(app: &mut App, tx: mpsc::Sender<MainMessage>,
                     }
                 }
             });
+            app.track_background_task(handle.abort_handle());
             return;
         }
 
@@ -393,14 +405,17 @@ pub(crate) fn start_playback_inner(app: &mut App, tx: mpsc::Sender<MainMessage>,
         let track = TrackInfo {
             title: music.name.clone(),
             artist: music.artist.clone(),
+            absolute_path: music.absolute_path.clone(),
             total_duration_ms: music.duration,
             lyrics: None, // will be set via finalize_streaming()
         };
 
-        let music_for_lyrics = music.clone();
+        let music_name = music.name.clone();
+        let music_artist = music.artist.clone();
+        let music_duration = music.duration;
         let server_for_lyrics = server.clone();
         let tx_for_lyrics = tx_clone.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let result =
                 crate::download::download_http_stream(&stream_url, &tx_clone, buf_for_download, track).await;
 
@@ -415,7 +430,7 @@ pub(crate) fn start_playback_inner(app: &mut App, tx: mpsc::Sender<MainMessage>,
                     let _ = tx_clone
                         .send(MainMessage::AudioDownloaded(music, data, None))
                         .await;
-                    spawn_lyrics_fetch(server_for_lyrics, music_for_lyrics, tx_for_lyrics);
+                    spawn_lyrics_fetch(server_for_lyrics, music_name, music_artist, music_duration, tx_for_lyrics);
                 }
                 Err(e) => {
                     let _ = tx_clone
@@ -424,21 +439,24 @@ pub(crate) fn start_playback_inner(app: &mut App, tx: mpsc::Sender<MainMessage>,
                 }
             }
         });
+        app.track_background_task(handle.abort_handle());
     } else {
         // ── Non-HTTP fallback (local files) ──
         app.downloading = true;
         app.status_message = crate::tf!("status.loading", &music.name);
+        let music_name = music.name.clone();
+        let music_artist = music.artist.clone();
+        let music_duration = music.duration;
         let tx_for_lyrics = tx_clone.clone();
-        let music_for_lyrics = music.clone();
         let server_for_lyrics = server.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             match server.fetch_audio(&music).await {
                 Ok(data) => {
                     // Send audio immediately; lyrics arrive separately
                     let _ = tx_clone
                         .send(MainMessage::AudioDownloaded(music, data, None))
                         .await;
-                    spawn_lyrics_fetch(server_for_lyrics, music_for_lyrics, tx_for_lyrics);
+                    spawn_lyrics_fetch(server_for_lyrics, music_name, music_artist, music_duration, tx_for_lyrics);
                 }
                 Err(e) => {
                     let _ = tx_clone
@@ -447,14 +465,15 @@ pub(crate) fn start_playback_inner(app: &mut App, tx: mpsc::Sender<MainMessage>,
                 }
             }
         });
+        app.track_background_task(handle.abort_handle());
     }
 }
 
 /// Spawn a background task to re-fetch the music list.
-pub(crate) fn refresh_music_list(app: &App, tx: &mpsc::Sender<MainMessage>) {
+pub(crate) fn refresh_music_list(app: &mut App, tx: &mpsc::Sender<MainMessage>) {
     let server = app.server.clone();
     let tx = tx.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         match server.fetch_list().await {
             Ok(list) => {
                 let _ = tx.send(MainMessage::MusicListLoaded(list)).await;
@@ -468,4 +487,5 @@ pub(crate) fn refresh_music_list(app: &App, tx: &mpsc::Sender<MainMessage>) {
             }
         }
     });
+    app.track_background_task(handle.abort_handle());
 }
