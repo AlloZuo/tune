@@ -64,6 +64,7 @@ cargo run --release
 | `/` | 搜索 |
 | `r` | 刷新音乐列表 |
 | `R` | 管理服务器（添加/编辑/删除/停用） |
+| `C` | 显示当前歌曲封面（半块字符渲染） |
 | `l` | 歌单管理 / 返回 |
 | `a` | 加入歌单 |
 | `c` | 创建歌单 |
@@ -242,6 +243,7 @@ cargo run --release
 | `/` | Search |
 | `r` | Refresh music list |
 | `R` | Manage servers (add/edit/delete/disable) |
+| `C` | Show cover art (half-block rendering) |
 | `l` | Playlist management / back |
 | `a` | Add to playlist |
 | `c` | Create playlist |
