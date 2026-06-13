@@ -1,9 +1,18 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, RwLock};
+use std::time::Duration;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::sync::{LazyLock, RwLock};
 
 use crate::server::{MusicEntry, ServerConfig};
 use crate::ui::Playlist;
+
+/// Debounce interval for config writes — rapid changes coalesce into one write.
+const DEBOUNCE_MS: Duration = Duration::from_millis(200);
+
+/// True when a deferred write is already scheduled.
+static SAVE_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Single unified config file — replaces the old separate files for servers,
 /// playlists, and language.
@@ -150,12 +159,12 @@ fn merge_legacy_playlists(cfg: &mut TuneConfig) {
 fn merge_legacy_lang(cfg: &mut TuneConfig) {
     let lang = std::fs::read_to_string(LEGACY_LANG)
         .ok()
-        .and_then(|s| {
+        .map(|s| {
             let s = s.trim().trim_matches('"').to_string();
             if s == "en" || s == "English" {
-                Some("en".to_string())
+                "en".to_string()
             } else {
-                Some("zh".to_string())
+                "zh".to_string()
             }
         })
         .unwrap_or_else(|| "zh".to_string());
@@ -197,31 +206,59 @@ const DEFAULT_VOLUME: f64 = 0.8;
 pub fn load_volume() -> f32 {
     CONFIG
         .read()
-        .unwrap()
+        .expect("CONFIG lock poisoned")
         .default_volume
         .unwrap_or(DEFAULT_VOLUME) as f32
 }
 
+/// Schedule a debounced config write. Multiple calls within `DEBOUNCE_MS`
+/// coalesce into a single write. The in-memory config is always up-to-date;
+/// only disk persistence is deferred.
+fn schedule_save() {
+    if SAVE_PENDING.swap(true, Ordering::AcqRel) {
+        return; // A deferred write is already scheduled
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(DEBOUNCE_MS).await;
+        SAVE_PENDING.store(false, Ordering::Release);
+        let cfg = CONFIG.read().expect("CONFIG lock poisoned");
+        let _ = save_config_inner(&cfg);
+    });
+}
+
+/// Force an immediate config write for any pending changes. Call on quit to
+/// ensure no data loss.
+pub fn flush_config() {
+    if !SAVE_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    SAVE_PENDING.store(false, Ordering::Release);
+    let cfg = CONFIG.read().expect("CONFIG lock poisoned");
+    let _ = save_config_inner(&cfg);
+}
+
 pub fn save_volume(vol: f32) -> Result<()> {
-    let mut cfg = CONFIG.write().unwrap();
+    let mut cfg = CONFIG.write().expect("CONFIG lock poisoned");
     cfg.default_volume = Some((vol as f64).clamp(0.0, 1.0));
-    save_config_inner(&cfg)
+    schedule_save();
+    Ok(())
 }
 
 pub fn load_servers() -> Vec<ServerConfig> {
-    CONFIG.read().unwrap().servers.clone()
+    CONFIG.read().expect("CONFIG lock poisoned").servers.clone()
 }
 
 pub fn save_servers(servers: &[ServerConfig]) -> Result<()> {
-    let mut cfg = CONFIG.write().unwrap();
+    let mut cfg = CONFIG.write().expect("CONFIG lock poisoned");
     cfg.servers = servers.to_vec();
-    save_config_inner(&cfg)
+    schedule_save();
+    Ok(())
 }
 
 pub fn load_playlists() -> Vec<Playlist> {
     CONFIG
         .read()
-        .unwrap()
+        .expect("CONFIG lock poisoned")
         .playlists
         .iter()
         .map(|pj| Playlist {
@@ -232,7 +269,7 @@ pub fn load_playlists() -> Vec<Playlist> {
 }
 
 pub fn save_playlists(playlists: &[Playlist]) -> Result<()> {
-    let mut cfg = CONFIG.write().unwrap();
+    let mut cfg = CONFIG.write().expect("CONFIG lock poisoned");
     cfg.playlists = playlists
         .iter()
         .map(|p| PlaylistJson {
@@ -240,31 +277,35 @@ pub fn save_playlists(playlists: &[Playlist]) -> Result<()> {
             songs: p.songs.clone(),
         })
         .collect();
-    save_config_inner(&cfg)
+    schedule_save();
+    Ok(())
 }
 
 pub fn load_language() -> String {
-    CONFIG.read().unwrap().language.clone()
+    CONFIG.read().expect("CONFIG lock poisoned").language.clone()
 }
 
 pub fn save_language(lang: &str) -> Result<()> {
-    let mut cfg = CONFIG.write().unwrap();
+    let mut cfg = CONFIG.write().expect("CONFIG lock poisoned");
     cfg.language = lang.to_string();
-    save_config_inner(&cfg)
+    schedule_save();
+    Ok(())
 }
 
 pub fn load_last_played() -> Option<LastPlayed> {
-    CONFIG.read().unwrap().last_played.clone()
+    CONFIG.read().expect("CONFIG lock poisoned").last_played.clone()
 }
 
 pub fn save_last_played(last: &LastPlayed) -> Result<()> {
-    let mut cfg = CONFIG.write().unwrap();
+    let mut cfg = CONFIG.write().expect("CONFIG lock poisoned");
     cfg.last_played = Some(last.clone());
-    save_config_inner(&cfg)
+    schedule_save();
+    Ok(())
 }
 
 pub fn clear_last_played() -> Result<()> {
-    let mut cfg = CONFIG.write().unwrap();
+    let mut cfg = CONFIG.write().expect("CONFIG lock poisoned");
     cfg.last_played = None;
-    save_config_inner(&cfg)
+    schedule_save();
+    Ok(())
 }
