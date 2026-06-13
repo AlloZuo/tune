@@ -161,6 +161,11 @@ impl PlayQueue {
         self.songs.iter()
     }
 
+    /// Only used in tests; rustc flags it as dead code in the binary target.
+    #[allow(dead_code)]
+    pub fn clear(&mut self) {
+        self.songs.clear();
+    }
 }
 
 // ── Progressive streaming buffer ──
