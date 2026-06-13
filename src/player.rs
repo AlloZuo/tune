@@ -7,10 +7,14 @@ use rand::rng;
 use rand::Rng;
 use rand::seq::SliceRandom;
 use rodio::{
-    source::SeekError, Decoder, OutputStream, OutputStreamHandle, Sink, Source,
+    Decoder, MixerDeviceSink, Source,
 };
+use rodio::Player as RodioPlayer;
 
 use crate::server::MusicEntry;
+
+/// Result type for the blocking decode step: a decoded source plus optional total duration.
+type DecodeResult = Result<(rodio::Decoder<std::io::Cursor<Vec<u8>>>, Option<std::time::Duration>)>;
 
 // ── Playback mode ──
 
@@ -66,15 +70,14 @@ impl ShuffleState {
     pub fn new(count: usize, exclude: Option<usize>) -> Self {
         let mut indices: Vec<usize> = (0..count).collect();
         indices.shuffle(&mut rng());
-        if let Some(ex) = exclude {
-            if count > 1 && indices.last() == Some(&ex) {
+        if let Some(ex) = exclude
+            && count > 1 && indices.last() == Some(&ex) {
                 // Swap the last element (which will be popped first) with
                 // a random element elsewhere, ensuring no immediate repeat.
                 let swap = rand::rng().random_range(0..count - 1);
                 let len = indices.len();
                 indices.swap(len - 1, swap);
             }
-        }
         Self { remaining: indices }
     }
 
@@ -83,11 +86,6 @@ impl ShuffleState {
         self.remaining.pop()
     }
 
-    /// Re-shuffle the whole set (used when the queue is exhausted).
-    #[allow(dead_code)]
-    pub fn reshuffle(&mut self, count: usize, exclude: Option<usize>) {
-        *self = Self::new(count, exclude);
-    }
 }
 
 // ── Play queue ──
@@ -155,11 +153,6 @@ impl PlayQueue {
         self.songs.is_empty()
     }
 
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.songs.clear();
-    }
-
     pub fn get(&self, index: usize) -> Option<&MusicEntry> {
         self.songs.get(index)
     }
@@ -168,10 +161,6 @@ impl PlayQueue {
         self.songs.iter()
     }
 
-    #[allow(dead_code)]
-    pub fn songs(&self) -> &[MusicEntry] {
-        &self.songs
-    }
 }
 
 // ── Progressive streaming buffer ──
@@ -205,23 +194,18 @@ impl SharedAudioBuf {
 
     /// Append a chunk of data and wake any blocked reader.
     pub fn push(&self, chunk: &[u8]) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("SharedAudioBuf lock poisoned");
         inner.data.extend_from_slice(chunk);
         self.data_ready.notify_all();
     }
 
     /// Mark the stream as complete. Any blocked reader will see EOF.
     pub fn set_eof(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("SharedAudioBuf lock poisoned");
         inner.eof = true;
         self.data_ready.notify_all();
     }
 
-    /// Total bytes received so far.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().data.len()
-    }
 }
 
 /// A `Read + Seek` wrapper around `SharedAudioBuf` for rodio's decoder.
@@ -240,9 +224,13 @@ impl StreamingCursor {
     }
 }
 
+/// Timeout for the streaming condvar — if no data arrives within this window
+/// the reader signals EOF instead of blocking forever (prevents hang on stall).
+const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Read for StreamingCursor {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut guard = self.buf.inner.lock().unwrap();
+        let mut guard = self.buf.inner.lock().expect("SharedAudioBuf lock poisoned");
         loop {
             if (self.pos as usize) < guard.data.len() {
                 let available = guard.data.len() - self.pos as usize;
@@ -255,15 +243,24 @@ impl Read for StreamingCursor {
             if guard.eof {
                 return Ok(0);
             }
-            // Block until more data arrives or EOF is set.
-            guard = self.buf.data_ready.wait(guard).unwrap();
+            // Block until more data arrives, EOF is set, or timeout elapses.
+            let (new_guard, wait_result) = self
+                .buf
+                .data_ready
+                .wait_timeout(guard, STREAM_TIMEOUT)
+                .expect("SharedAudioBuf condvar wait poisoned");
+            guard = new_guard;
+            if wait_result.timed_out() {
+                // Stream appears stalled — signal EOF so the decoder stops.
+                return Ok(0);
+            }
         }
     }
 }
 
 impl Seek for StreamingCursor {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let guard = self.buf.inner.lock().unwrap();
+        let guard = self.buf.inner.lock().expect("SharedAudioBuf lock poisoned");
         let new_pos = match pos {
             SeekFrom::Start(p) => p,
             SeekFrom::Current(offset) => {
@@ -310,6 +307,7 @@ use crate::lyrics::Lyrics;
 pub struct TrackInfo {
     pub title: String,
     pub artist: String,
+    pub absolute_path: String,
     pub total_duration_ms: u64,
     pub lyrics: Option<Lyrics>,
 }
@@ -317,9 +315,8 @@ pub struct TrackInfo {
 // ── Player ──
 
 pub struct Player {
-    sink: Option<Sink>,
-    _stream: OutputStream,
-    _stream_handle: OutputStreamHandle,
+    rodio_player: Option<RodioPlayer>,
+    _device_sink: MixerDeviceSink,
     state: PlayerState,
     current_track: Option<TrackInfo>,
     volume: f32,
@@ -344,11 +341,10 @@ pub struct Player {
 
 impl Player {
     pub fn new() -> Result<Self> {
-        let (_stream, stream_handle) = OutputStream::try_default()?;
+        let device_sink = rodio::DeviceSinkBuilder::open_default_sink()?;
         Ok(Self {
-            sink: None,
-            _stream,
-            _stream_handle: stream_handle,
+            rodio_player: None,
+            _device_sink: device_sink,
             state: PlayerState::Stopped,
             current_track: None,
             volume: 1.0,
@@ -367,10 +363,13 @@ impl Player {
         self.audio_data = Some(data.clone());
 
         let (source, decoded_duration) = {
-            let result: Result<(rodio::Decoder<Cursor<Vec<u8>>>, Option<Duration>)> =
+            let result: DecodeResult =
                 tokio::task::spawn_blocking(move || {
                     let cursor = Cursor::new(data);
-                    let source = Decoder::new(cursor)?;
+                    let source = Decoder::builder()
+                        .with_data(cursor)
+                        .with_seekable(true)
+                        .build()?;
                     let dur = source.total_duration();
                     Ok::<_, anyhow::Error>((source, dur))
                 })
@@ -379,22 +378,21 @@ impl Player {
             result?
         };
 
-        if let Some(sink) = &self.sink {
-            sink.stop();
+        if let Some(rodio_player) = &self.rodio_player {
+            rodio_player.stop();
         }
 
         let mut track = track;
-        if track.total_duration_ms == 0 {
-            if let Some(dur) = decoded_duration {
+        if track.total_duration_ms == 0
+            && let Some(dur) = decoded_duration {
                 track.total_duration_ms = dur.as_millis() as u64;
             }
-        }
 
-        let sink = Sink::try_new(&self._stream_handle)?;
-        sink.set_volume(self.volume);
-        sink.append(source);
+        let rodio_player = RodioPlayer::connect_new(self._device_sink.mixer());
+        rodio_player.set_volume(self.volume);
+        rodio_player.append(source);
 
-        self.sink = Some(sink);
+        self.rodio_player = Some(rodio_player);
         self.seek_offset_ms = 0;
         self.state = PlayerState::Playing;
         self.current_track = Some(track);
@@ -413,7 +411,7 @@ impl Player {
         // check instead of wait_while to avoid freezing the main loop.
         const MIN_BYTES: usize = 256 * 1024;
         {
-            let guard = buf.inner.lock().unwrap();
+            let guard = buf.inner.lock().expect("SharedAudioBuf lock poisoned");
             if guard.data.len() < MIN_BYTES && !guard.eof {
                 anyhow::bail!("Not enough data buffered for streaming (have {} bytes, need {})", guard.data.len(), MIN_BYTES);
             }
@@ -423,24 +421,26 @@ impl Player {
         }
 
         let cursor = StreamingCursor::new(buf.clone());
-        let source = Decoder::new(cursor)?;
+        let source = Decoder::builder()
+            .with_data(cursor)
+            .with_seekable(true)
+            .build()?;
 
-        if let Some(sink) = &self.sink {
-            sink.stop();
+        if let Some(rodio_player) = &self.rodio_player {
+            rodio_player.stop();
         }
 
         let mut track = track;
-        if track.total_duration_ms == 0 {
-            if let Some(dur) = source.total_duration() {
+        if track.total_duration_ms == 0
+            && let Some(dur) = source.total_duration() {
                 track.total_duration_ms = dur.as_millis() as u64;
             }
-        }
 
-        let sink = Sink::try_new(&self._stream_handle)?;
-        sink.set_volume(self.volume);
-        sink.append(source);
+        let rodio_player = RodioPlayer::connect_new(self._device_sink.mixer());
+        rodio_player.set_volume(self.volume);
+        rodio_player.append(source);
 
-        self.sink = Some(sink);
+        self.rodio_player = Some(rodio_player);
         self.seek_offset_ms = 0;
         self.state = PlayerState::Playing;
         self.current_track = Some(track);
@@ -455,20 +455,18 @@ impl Player {
     /// Update lyrics on the current track after playback has started.
     /// Used when lyrics arrive asynchronously (LyricsReady message).
     pub fn set_lyrics(&mut self, lyrics: Option<Lyrics>) {
-        if let Some(ref mut track) = self.current_track {
-            if lyrics.is_some() {
+        if let Some(ref mut track) = self.current_track
+            && lyrics.is_some() {
                 track.lyrics = lyrics;
             }
-        }
     }
 
     pub fn finalize_streaming(&mut self, data: Vec<u8>, lyrics: Option<Lyrics>) {
         self.audio_data = Some(data);
-        if let Some(ref mut track) = self.current_track {
-            if lyrics.is_some() {
+        if let Some(ref mut track) = self.current_track
+            && lyrics.is_some() {
                 track.lyrics = lyrics;
             }
-        }
         self.streaming_buf = None;
     }
 
@@ -478,7 +476,7 @@ impl Player {
         let data = if let Some(ref buf) = self.streaming_buf {
             // If the download is still in progress, wait for it to complete
             // so we have the full file for re-decoding.
-            let mut guard = buf.inner.lock().unwrap();
+            let mut guard = buf.inner.lock().expect("SharedAudioBuf lock poisoned");
             if !guard.eof {
                 // Block until EOF so we can re-decode from scratch.
                 guard = buf
@@ -505,31 +503,37 @@ impl Player {
         let pos_ms = pos_ms.min(total.saturating_sub(200)); // leave 200ms margin
         let seek_dur = Duration::from_millis(pos_ms);
 
-        // Try native decoder seek first (works for MP3, WAV, etc.).
-        // If the decoder doesn't support seeking (FLAC, etc.), fall back
-        // to skip_duration which skips decoded samples manually.
+        // Use DecoderBuilder with byte_len so symphonia's FLAC demuxer
+        // can do binary seeking (needs byte_len for the search range).
+        let byte_len = data.len() as u64;
         let cursor = Cursor::new(data.clone());
-        let mut source = Decoder::new(cursor)?;
+        let mut source = Decoder::builder()
+            .with_data(cursor)
+            .with_byte_len(byte_len)
+            .with_seekable(true)
+            .build()?;
 
-        let seeked_source: Box<dyn Source<Item = i16> + Send> = match source.try_seek(seek_dur) {
+        let seeked_source: Box<dyn Source<Item = f32> + Send> = match source.try_seek(seek_dur) {
             Ok(()) => Box::new(source),
-            Err(SeekError::NotSupported { .. }) => {
-                // Re-decode and skip samples
+            Err(e) => {
+                eprintln!("Seek failed ({e}), falling back to skip_duration");
                 let cursor2 = Cursor::new(data.clone());
-                let source2 = Decoder::new(cursor2)?;
+                let source2 = Decoder::builder()
+                    .with_data(cursor2)
+                    .with_seekable(true)
+                    .build()?;
                 Box::new(source2.skip_duration(seek_dur))
             }
-            Err(_) => anyhow::bail!("seek failed"),
         };
 
-        if let Some(sink) = &self.sink {
-            sink.stop();
+        if let Some(rodio_player) = &self.rodio_player {
+            rodio_player.stop();
         }
-        let sink = Sink::try_new(&self._stream_handle)?;
-        sink.set_volume(self.volume);
-        sink.append(seeked_source);
+        let rodio_player = RodioPlayer::connect_new(self._device_sink.mixer());
+        rodio_player.set_volume(self.volume);
+        rodio_player.append(seeked_source);
 
-        self.sink = Some(sink);
+        self.rodio_player = Some(rodio_player);
         self.seek_offset_ms = pos_ms;
         self.state = PlayerState::Playing;
         Ok(())
@@ -539,7 +543,7 @@ impl Player {
     /// blocking the async runtime during re-decoding for seek.
     pub async fn seek_to_ms_async(&mut self, pos_ms: u64) -> Result<()> {
         let data = if let Some(ref buf) = self.streaming_buf {
-            let mut guard = buf.inner.lock().unwrap();
+            let mut guard = buf.inner.lock().expect("SharedAudioBuf lock poisoned");
             if !guard.eof {
                 guard = buf
                     .data_ready
@@ -566,22 +570,30 @@ impl Player {
         let seek_dur = Duration::from_millis(pos_ms);
 
         let data_for_fallback = data.clone();
-        let seeked_source: Box<dyn Source<Item = i16> + Send> =
+        let byte_len = data.len() as u64;
+        let seeked_source: Box<dyn Source<Item = f32> + Send> =
             {
-                let result: Result<Box<dyn Source<Item = i16> + Send>> =
+                let result: Result<Box<dyn Source<Item = f32> + Send>> =
                     tokio::task::spawn_blocking(move || {
                         let cursor = Cursor::new(data);
-                        let mut source = Decoder::new(cursor)?;
+                        let mut source = Decoder::builder()
+                            .with_data(cursor)
+                            .with_byte_len(byte_len)
+                            .with_seekable(true)
+                            .build()?;
 
-                        let seeked: Box<dyn Source<Item = i16> + Send> =
+                        let seeked: Box<dyn Source<Item = f32> + Send> =
                             match source.try_seek(seek_dur) {
                                 Ok(()) => Box::new(source),
-                                Err(SeekError::NotSupported { .. }) => {
+                                Err(e) => {
+                                    eprintln!("Seek failed ({e}), falling back to skip_duration");
                                     let cursor2 = Cursor::new(data_for_fallback);
-                                    let source2 = Decoder::new(cursor2)?;
+                                    let source2 = Decoder::builder()
+                                        .with_data(cursor2)
+                                        .with_seekable(true)
+                                        .build()?;
                                     Box::new(source2.skip_duration(seek_dur))
                                 }
-                                Err(_) => anyhow::bail!("seek failed"),
                             };
                         Ok::<_, anyhow::Error>(seeked)
                     })
@@ -590,14 +602,14 @@ impl Player {
                 result?
             };
 
-        if let Some(sink) = &self.sink {
-            sink.stop();
+        if let Some(rodio_player) = &self.rodio_player {
+            rodio_player.stop();
         }
-        let sink = Sink::try_new(&self._stream_handle)?;
-        sink.set_volume(self.volume);
-        sink.append(seeked_source);
+        let rodio_player = RodioPlayer::connect_new(self._device_sink.mixer());
+        rodio_player.set_volume(self.volume);
+        rodio_player.append(seeked_source);
 
-        self.sink = Some(sink);
+        self.rodio_player = Some(rodio_player);
         self.seek_offset_ms = pos_ms;
         self.state = PlayerState::Playing;
         Ok(())
@@ -640,17 +652,16 @@ impl Player {
     /// Call this on the main loop when `SeekPrepared` is received.
     pub fn apply_seek_source(
         &mut self,
-        source: Box<dyn Source<Item = i16> + Send>,
+        source: Box<dyn Source<Item = f32> + Send>,
         pos_ms: u64,
     ) {
-        if let Some(sink) = &self.sink {
-            sink.stop();
+        if let Some(rodio_player) = &self.rodio_player {
+            rodio_player.stop();
         }
-        if let Ok(sink) = Sink::try_new(&self._stream_handle) {
-            sink.set_volume(self.volume);
-            sink.append(source);
-            self.sink = Some(sink);
-        }
+        let rodio_player = RodioPlayer::connect_new(self._device_sink.mixer());
+        rodio_player.set_volume(self.volume);
+        rodio_player.append(source);
+        self.rodio_player = Some(rodio_player);
         self.seek_offset_ms = pos_ms;
         self.state = PlayerState::Playing;
     }
@@ -661,8 +672,8 @@ impl Player {
 
     pub fn pause(&mut self) {
         if self.state == PlayerState::Playing {
-            if let Some(sink) = &self.sink {
-                sink.pause();
+            if let Some(rodio_player) = &self.rodio_player {
+                rodio_player.pause();
             }
             self.state = PlayerState::Paused;
         }
@@ -670,16 +681,16 @@ impl Player {
 
     pub fn resume(&mut self) {
         if self.state == PlayerState::Paused {
-            if let Some(sink) = &self.sink {
-                sink.play();
+            if let Some(rodio_player) = &self.rodio_player {
+                rodio_player.play();
             }
             self.state = PlayerState::Playing;
         }
     }
 
     pub fn stop(&mut self) {
-        if let Some(sink) = &self.sink {
-            sink.stop();
+        if let Some(rodio_player) = &self.rodio_player {
+            rodio_player.stop();
         }
         self.state = PlayerState::Stopped;
         self.current_track = None;
@@ -700,8 +711,8 @@ impl Player {
         // Quantise to nearest 5 % to prevent floating-point drift
         self.volume = (vol * 20.0).round() / 20.0;
         self.volume = self.volume.clamp(0.0, 2.0);
-        if let Some(sink) = &self.sink {
-            sink.set_volume(self.volume);
+        if let Some(rodio_player) = &self.rodio_player {
+            rodio_player.set_volume(self.volume);
         }
     }
 
@@ -716,14 +727,6 @@ impl Player {
         self.shuffle_state = None;
     }
 
-    /// Prepare shuffle queue for the given list length.
-    #[allow(dead_code)]
-    pub fn init_shuffle(&mut self, list_len: usize) {
-        if self.play_mode == PlayMode::Shuffle {
-            self.shuffle_state = Some(ShuffleState::new(list_len.max(1), None));
-        }
-    }
-
     /// Pop the next shuffle index; caller should re-shuffle if `None`.
     pub fn next_shuffle_index(&mut self) -> Option<usize> {
         self.shuffle_state.as_mut().and_then(|s| s.next())
@@ -733,19 +736,15 @@ impl Player {
 
     /// Check if playback has finished.
     pub fn is_finished(&self) -> bool {
-        self.sink.as_ref().map_or(true, |s| s.empty())
-    }
-
-    pub fn is_stopped(&self) -> bool {
-        self.state == PlayerState::Stopped
+        self.rodio_player.as_ref().is_none_or(|p| p.empty())
     }
 
     /// Current playback position in milliseconds (absolute, accounting for seek).
     pub fn position_ms(&self) -> u64 {
         let sink_pos = self
-            .sink
+            .rodio_player
             .as_ref()
-            .map(|s| s.get_pos().as_millis() as u64)
+            .map(|p| p.get_pos().as_millis() as u64)
             .unwrap_or(0);
         self.seek_offset_ms + sink_pos
     }
@@ -775,23 +774,31 @@ impl Player {
 pub async fn decode_seek_source(
     data: Vec<u8>,
     pos_ms: u64,
-) -> Result<Box<dyn Source<Item = i16> + Send>> {
+) -> Result<Box<dyn Source<Item = f32> + Send>> {
     let data_for_fallback = data.clone();
+    let byte_len = data.len() as u64;
     let seek_dur = Duration::from_millis(pos_ms);
 
-    let result: Result<Box<dyn Source<Item = i16> + Send>> =
+    let result: Result<Box<dyn Source<Item = f32> + Send>> =
         tokio::task::spawn_blocking(move || {
             let cursor = Cursor::new(data);
-            let mut source = Decoder::new(cursor)?;
+            let mut source = Decoder::builder()
+                .with_data(cursor)
+                .with_byte_len(byte_len)
+                .with_seekable(true)
+                .build()?;
 
-            let seeked: Box<dyn Source<Item = i16> + Send> = match source.try_seek(seek_dur) {
+            let seeked: Box<dyn Source<Item = f32> + Send> = match source.try_seek(seek_dur) {
                 Ok(()) => Box::new(source),
-                Err(SeekError::NotSupported { .. }) => {
+                Err(e) => {
+                    eprintln!("Seek failed ({e}), falling back to skip_duration");
                     let cursor2 = Cursor::new(data_for_fallback);
-                    let source2 = Decoder::new(cursor2)?;
+                    let source2 = Decoder::builder()
+                        .with_data(cursor2)
+                        .with_seekable(true)
+                        .build()?;
                     Box::new(source2.skip_duration(seek_dur))
                 }
-                Err(_) => anyhow::bail!("seek failed"),
             };
             Ok::<_, anyhow::Error>(seeked)
         })
@@ -806,15 +813,13 @@ mod tests {
     use super::*;
     use crate::server::MusicEntry;
 
-    fn make_song(id: u64, name: &str) -> MusicEntry {
+    fn make_song(name: &str) -> MusicEntry {
         MusicEntry {
-            id,
             absolute_path: format!("/music/{}.mp3", name),
             name: name.to_string(),
             artist: "test".to_string(),
             album: String::new(),
             duration: 200_000,
-            size: 1000,
             server_id: "test-server".to_string(),
         }
     }
@@ -831,8 +836,8 @@ mod tests {
     #[test]
     fn test_push_back_and_pop_front() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
-        q.push_back(make_song(2, "B"));
+        q.push_back(make_song("A"));
+        q.push_back(make_song("B"));
         assert_eq!(q.len(), 2);
 
         let a = q.pop_front().unwrap();
@@ -847,8 +852,8 @@ mod tests {
     #[test]
     fn test_push_front_play_next() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
-        q.push_front(make_song(2, "B"));
+        q.push_back(make_song("A"));
+        q.push_front(make_song("B"));
         // B should be first (play next)
         assert_eq!(q.pop_front().unwrap().name, "B");
         assert_eq!(q.pop_front().unwrap().name, "A");
@@ -863,9 +868,9 @@ mod tests {
     #[test]
     fn test_remove_by_index() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
-        q.push_back(make_song(2, "B"));
-        q.push_back(make_song(3, "C"));
+        q.push_back(make_song("A"));
+        q.push_back(make_song("B"));
+        q.push_back(make_song("C"));
 
         let b = q.remove(1).unwrap();
         assert_eq!(b.name, "B");
@@ -879,7 +884,7 @@ mod tests {
     #[test]
     fn test_remove_out_of_bounds_returns_none() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
+        q.push_back(make_song("A"));
         assert!(q.remove(5).is_none());
         assert_eq!(q.len(), 1);
     }
@@ -887,9 +892,9 @@ mod tests {
     #[test]
     fn test_move_up() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
-        q.push_back(make_song(2, "B"));
-        q.push_back(make_song(3, "C"));
+        q.push_back(make_song("A"));
+        q.push_back(make_song("B"));
+        q.push_back(make_song("C"));
 
         q.move_up(2); // C → [A, C, B]
         assert_eq!(q.get(0).unwrap().name, "A");
@@ -903,8 +908,8 @@ mod tests {
     #[test]
     fn test_move_up_first_element_does_nothing() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
-        q.push_back(make_song(2, "B"));
+        q.push_back(make_song("A"));
+        q.push_back(make_song("B"));
         q.move_up(0); // A is already first
         assert_eq!(q.get(0).unwrap().name, "A");
         assert_eq!(q.get(1).unwrap().name, "B");
@@ -913,9 +918,9 @@ mod tests {
     #[test]
     fn test_move_down() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
-        q.push_back(make_song(2, "B"));
-        q.push_back(make_song(3, "C"));
+        q.push_back(make_song("A"));
+        q.push_back(make_song("B"));
+        q.push_back(make_song("C"));
 
         q.move_down(0); // A → [B, A, C]
         assert_eq!(q.get(0).unwrap().name, "B");
@@ -926,8 +931,8 @@ mod tests {
     #[test]
     fn test_move_down_last_element_does_nothing() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
-        q.push_back(make_song(2, "B"));
+        q.push_back(make_song("A"));
+        q.push_back(make_song("B"));
         q.move_down(1);
         assert_eq!(q.get(0).unwrap().name, "A");
         assert_eq!(q.get(1).unwrap().name, "B");
@@ -936,8 +941,8 @@ mod tests {
     #[test]
     fn test_clear() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
-        q.push_back(make_song(2, "B"));
+        q.push_back(make_song("A"));
+        q.push_back(make_song("B"));
         q.clear();
         assert!(q.is_empty());
         assert_eq!(q.len(), 0);
@@ -946,8 +951,8 @@ mod tests {
     #[test]
     fn test_get_and_iter() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
-        q.push_back(make_song(2, "B"));
+        q.push_back(make_song("A"));
+        q.push_back(make_song("B"));
 
         assert_eq!(q.get(0).unwrap().name, "A");
         assert_eq!(q.get(1).unwrap().name, "B");
@@ -960,9 +965,9 @@ mod tests {
     #[test]
     fn test_fifo_order() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "X"));
-        q.push_back(make_song(2, "Y"));
-        q.push_back(make_song(3, "Z"));
+        q.push_back(make_song("X"));
+        q.push_back(make_song("Y"));
+        q.push_back(make_song("Z"));
 
         assert_eq!(q.pop_front().unwrap().name, "X");
         assert_eq!(q.pop_front().unwrap().name, "Y");
@@ -973,9 +978,9 @@ mod tests {
     #[test]
     fn test_push_front_after_push_back() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
-        q.push_back(make_song(2, "B"));
-        q.push_front(make_song(3, "C")); // C jumps ahead of A
+        q.push_back(make_song("A"));
+        q.push_back(make_song("B"));
+        q.push_front(make_song("C")); // C jumps ahead of A
 
         assert_eq!(q.pop_front().unwrap().name, "C");
         assert_eq!(q.pop_front().unwrap().name, "A");
@@ -985,11 +990,11 @@ mod tests {
     #[test]
     fn test_interleaved_add_remove() {
         let mut q = PlayQueue::new();
-        q.push_back(make_song(1, "A"));
-        q.push_back(make_song(2, "B"));
+        q.push_back(make_song("A"));
+        q.push_back(make_song("B"));
         q.pop_front(); // remove A
-        q.push_back(make_song(3, "C"));
-        q.push_front(make_song(4, "D")); // D jumps to front
+        q.push_back(make_song("C"));
+        q.push_front(make_song("D")); // D jumps to front
 
         // Queue: D, B, C
         assert_eq!(q.pop_front().unwrap().name, "D");
